@@ -70,12 +70,40 @@ class Api:
         return paths
 
     def remove_file(self, path):
-        """删除名单文件路径"""
+        """删除名单文件路径，同时删除文件本身"""
         paths = self.get_file_list()
         if path in paths:
             paths.remove(path)
             self._save_file_list(paths)
+        abs_path = self._resolve_path(path)
+        try:
+            os.remove(abs_path)
+        except OSError:
+            pass
         return paths
+
+    def create_new_file(self, name):
+        """创建空白名单文件"""
+        if not name.endswith('.txt'):
+            name += '.txt'
+        path = os.path.join(BASE_DIR, name)
+        if not os.path.exists(path):
+            with open(path, 'w', encoding='utf-8') as f:
+                pass
+        paths = self.get_file_list()
+        if path not in paths:
+            paths.append(path)
+            self._save_file_list(paths)
+        return paths
+
+    def edit_file(self, path):
+        """用默认编辑器打开名单文件"""
+        abs_path = self._resolve_path(path)
+        try:
+            os.startfile(abs_path)
+            return True
+        except OSError:
+            return False
 
     def browse_file(self):
         """打开文件浏览器选择名单文件"""
@@ -340,6 +368,8 @@ HTML = r"""<!DOCTYPE html>
     <div id="count" class="count"></div>
     <div class="file-mgr">
       <select id="file-select" title="选择名单文件"></select>
+      <button id="new-btn">新名单</button>
+      <button id="edit-btn">编辑内容</button>
       <button id="add-btn">浏览添加</button>
       <button id="del-btn" class="del-btn">删除</button>
     </div>
@@ -354,6 +384,8 @@ HTML = r"""<!DOCTYPE html>
   var modeSelect = document.getElementById('mode');
   var modeDesc = document.getElementById('mode-desc');
   var fileSelect = document.getElementById('file-select');
+  var newBtn = document.getElementById('new-btn');
+  var editBtn = document.getElementById('edit-btn');
   var addBtn = document.getElementById('add-btn');
   var delBtn = document.getElementById('del-btn');
   var firstPickDone = false;  // 第一次点名后标题缩小、名字框放大
@@ -490,6 +522,23 @@ HTML = r"""<!DOCTYPE html>
         loadFileList();
         reloadNames();
       });
+    }
+  });
+
+  newBtn.addEventListener('click', function () {
+    var name = prompt('请输入新名单文件名（不含扩展名）：');
+    if (name) {
+      window.pywebview.api.create_new_file(name).then(function () {
+        loadFileList();
+        reloadNames();
+      });
+    }
+  });
+
+  editBtn.addEventListener('click', function () {
+    var path = fileSelect.value;
+    if (path) {
+      window.pywebview.api.edit_file(path);
     }
   });
 
