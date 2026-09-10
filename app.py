@@ -11,7 +11,9 @@ if getattr(sys, "frozen", False) or "__compiled__" in dir():
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_LIST = os.path.join(BASE_DIR, 'file.txt')
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+FILE_LIST = os.path.join(DATA_DIR, 'file.txt')
 
 
 class Api:
@@ -24,17 +26,17 @@ class Api:
         self._window = None         # 主窗口引用，用于 Esc 切换全屏
 
     def _resolve_path(self, path):
-        """相对路径基于 BASE_DIR 解析"""
+        """相对路径基于 DATA_DIR 解析"""
         if os.path.isabs(path):
             return path
-        return os.path.join(BASE_DIR, path)
+        return os.path.join(DATA_DIR, path)
 
     def _get_current_path(self):
         """当前选中文件（file.txt 第一行）的绝对路径"""
         files = self.get_file_list()
         if files:
             return self._resolve_path(files[0])
-        return os.path.join(BASE_DIR, 'person.txt')
+        return os.path.join(DATA_DIR, 'person.txt')
 
     def _save_file_list(self, paths):
         """保存名单路径列表到 file.txt"""
@@ -86,7 +88,7 @@ class Api:
         """创建空白名单文件"""
         if not name.endswith('.txt'):
             name += '.txt'
-        path = os.path.join(BASE_DIR, name)
+        path = os.path.join(DATA_DIR, name)
         if not os.path.exists(path):
             with open(path, 'w', encoding='utf-8') as f:
                 pass
@@ -363,6 +365,7 @@ HTML = r"""<!DOCTYPE html>
         <option value="dedup">去重模式</option>
       </select>
       <button id="fsbtn" class="fs-btn">全屏 / 窗口</button>
+      <button id="voice-btn" class="fs-btn" title="朗读点名结果"> 语音</button>
     </div>
     <div id="mode-desc" class="mode-desc"></div>
     <div id="count" class="count"></div>
@@ -388,8 +391,9 @@ HTML = r"""<!DOCTYPE html>
   var editBtn = document.getElementById('edit-btn');
   var addBtn = document.getElementById('add-btn');
   var delBtn = document.getElementById('del-btn');
-  var firstPickDone = false;  // 第一次点名后标题缩小、名字框放大
   var currentNameSize = { fs: 16.5, lh: 30 };  // 当前名字字号（vh），初始 30vh×0.55
+  var voiceEnabled = true;  // 语音朗读开关
+  var voiceBtn = document.getElementById('voice-btn');
 
   var DESCRIPTIONS = {
     normal:  '完全随机抽取，可能连续抽到同一人',
@@ -431,6 +435,28 @@ HTML = r"""<!DOCTYPE html>
   document.getElementById('fsbtn').addEventListener('click', function () {
     window.pywebview.api.toggle_fullscreen();
   });
+
+  // 语音朗读
+  voiceBtn.addEventListener('click', function () {
+    voiceEnabled = !voiceEnabled;
+    voiceBtn.textContent = voiceEnabled ? ' 语音' : '静音';
+    voiceBtn.style.opacity = voiceEnabled ? '1' : '0.5';
+  });
+
+  function speak(text) {
+    if (!voiceEnabled || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    var u = new SpeechSynthesisUtterance(text);
+    // 检测是否包含中文
+    if (/[\u4e00-\u9fff]/.test(text)) {
+      u.lang = 'zh-CN';
+    } else {
+      u.lang = 'en-US';
+    }
+    u.rate = 0.9;
+    u.pitch = 1;
+    window.speechSynthesis.speak(u);
+  }
 
   function showStatic(text) {
     display.innerHTML = '';
@@ -597,25 +623,21 @@ HTML = r"""<!DOCTYPE html>
       currentEl = el;
       fitName(el);
       display.classList.remove('rolling');
-      display.classList.add('result');   // 定格为橙色渐变高亮
+      display.classList.add('result', 'expand');   // 定格为橙色渐变高亮，放大显示
+      document.querySelector('h1').classList.add('shrink');
+      // 更新 currentNameSize 供后续 tick 使用
+      currentNameSize.fs = 24.2;
+      currentNameSize.lh = 44;
+      // 给所有现存名字元素设置新字号（CSS transition 平滑过渡）
+      var els = display.querySelectorAll('.name');
+      for (var i = 0; i < els.length; i++) {
+        els[i].style.fontSize = '24.2vh';
+        els[i].style.lineHeight = '44vh';
+      }
       btn.disabled = false;
       btn.textContent = '再 来 一 次';
       rolling = false;
-      // 第一次点名后：标题缩小、名字框放大（仅执行一次）
-      if (!firstPickDone) {
-        firstPickDone = true;
-        document.querySelector('h1').classList.add('shrink');
-        display.classList.add('expand');
-        // 更新 currentNameSize 供后续 tick 使用
-        currentNameSize.fs = 24.2;
-        currentNameSize.lh = 44;
-        // 给所有现存名字元素设置新字号（CSS transition 平滑过渡）
-        var els = display.querySelectorAll('.name');
-        for (var i = 0; i < els.length; i++) {
-          els[i].style.fontSize = '24.2vh';
-          els[i].style.lineHeight = '44vh';
-        }
-      }
+      speak(name + '被选中');
     });
   }
 
