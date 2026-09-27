@@ -2,6 +2,8 @@
 """随机点名工具 —— 使用 pywebview 渲染内嵌 HTML 页面"""
 import os
 import sys
+import atexit
+import shutil
 import random
 
 import webview
@@ -14,6 +16,148 @@ else:
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
 FILE_LIST = os.path.join(DATA_DIR, 'file.txt')
+
+# 命名 Mutex 名称（系统范围内唯一，用于单实例互斥）
+MUTEX_NAME = 'RandomNamePicker.Main.SingleInstance'
+
+
+def log(msg, level='INFO'):
+    """写入日志文件便于排查。
+
+    格式：[时间] [级别] [线程] 消息
+    level: INFO / WARN / ERROR / DEBUG
+    """
+    try:
+        import time as _t
+        import threading
+        ts = _t.strftime('%Y-%m-%d %H:%M:%S')
+        ms = int((_t.time() % 1) * 1000)
+        thread_name = threading.current_thread().name
+        line = f'[{ts}.{ms:03d}] [{level:<5}] [{thread_name}] {msg}\n'
+        with open(os.path.join(BASE_DIR, 'app.log'), 'a', encoding='utf-8') as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def log_exc(msg):
+    """记录异常及其完整堆栈，便于定位问题。"""
+    import traceback
+    log(f'{msg}\n{traceback.format_exc()}', level='ERROR')
+
+
+def log_env():
+    """记录运行环境信息，便于排查平台相关问题。"""
+    log('-' * 60)
+    log(f'主程序启动 | PID={os.getpid()}')
+    log(f'Python={sys.version.split()[0]} | 平台={sys.platform} | frozen={getattr(sys, "frozen", False)}')
+    log(f'BASE_DIR={BASE_DIR}')
+    log(f'可执行文件={sys.executable}')
+    log(f'数据目录={DATA_DIR}（存在={os.path.isdir(DATA_DIR)}）')
+    log(f'名单文件={FILE_LIST}（存在={os.path.exists(FILE_LIST)}）')
+    log(f'工作目录={os.getcwd()}')
+    log(f'Mutex 名：{MUTEX_NAME}')
+    log('-' * 60)
+
+
+# ---------------------------------------------------------------------------
+# 单实例互斥：命名 Mutex
+# ---------------------------------------------------------------------------
+
+class SingleInstance:
+    """基于命名 Mutex 的跨进程单实例锁。
+
+    Windows 使用 CreateMutexW + GetLastError 判定；其他系统用文件锁模拟，
+    保证不同平台行为一致。获取失败即表示已有实例在运行。
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self._handle = None
+        self._lock_file = None
+        self.acquired = False
+
+    def acquire(self):
+        """尝试获取所有权。成功返回 True，已有实例返回 False。"""
+        log(f'尝试获取 Mutex：{self.name}', level='DEBUG')
+        try:
+            if os.name == 'nt':
+                return self._acquire_windows()
+            return self._acquire_posix()
+        except Exception as e:
+            # 出错时保守放行，避免因锁机制本身故障导致程序无法启动
+            log_exc(f'Mutex 获取异常，放行启动：{e}')
+            self.acquired = False
+            return True
+
+    def _acquire_windows(self):
+        import ctypes
+        from ctypes import wintypes
+
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL,
+                                          wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        err = ctypes.get_last_error()
+        if not handle:
+            log(f'CreateMutexW 失败，错误码 {err}，放行启动', level='WARN')
+            return True
+        if err == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            log(f'检测到已有实例运行（Mutex={self.name}），退出', level='WARN')
+            return False
+        self._handle = handle
+        self.acquired = True
+        log(f'Mutex 获取成功：{self.name}（句柄={handle}）')
+        return True
+
+    def _acquire_posix(self):
+        import fcntl
+        import tempfile
+
+        safe = self.name.replace('\\', '_').replace('/', '_')
+        path = os.path.join(tempfile.gettempdir(), safe + '.lock')
+        self._lock_file = open(path, 'a+')
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            self._lock_file.close()
+            self._lock_file = None
+            log(f'检测到已有实例运行（锁文件={path}）：{e}，退出', level='WARN')
+            return False
+        self.acquired = True
+        log(f'Mutex 获取成功：{path}')
+        return True
+
+    def release(self):
+        """释放 Mutex 资源，可重复调用。"""
+        if self._handle is not None:
+            try:
+                import ctypes
+                ctypes.WinDLL('kernel32', use_last_error=True).CloseHandle(
+                    self._handle)
+                log(f'Mutex 已释放：{self.name}（句柄={self._handle}）')
+            except Exception as e:
+                log_exc(f'Mutex 释放失败：{e}')
+            finally:
+                self._handle = None
+        if self._lock_file is not None:
+            try:
+                import fcntl
+                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                self._lock_file.close()
+                log(f'Mutex 已释放：{self.name}')
+            except Exception as e:
+                log_exc(f'Mutex 释放失败：{e}')
+            finally:
+                self._lock_file = None
+        self.acquired = False
+
+
+_instance_lock = SingleInstance(MUTEX_NAME)
 
 
 class Api:
@@ -64,10 +208,23 @@ class Api:
         return True
 
     def add_file(self, path):
-        """添加名单文件路径"""
+        """添加名单文件，复制到 data 目录下"""
+        filename = os.path.basename(path)
+        dest = os.path.join(DATA_DIR, filename)
+        # 如果 data 下已有同名文件，自动加序号避免覆盖
+        if os.path.exists(dest) and os.path.abspath(path) != os.path.abspath(dest):
+            base, ext = os.path.splitext(filename)
+            i = 1
+            while os.path.exists(os.path.join(DATA_DIR, f'{base}_{i}{ext}')):
+                i += 1
+            filename = f'{base}_{i}{ext}'
+            dest = os.path.join(DATA_DIR, filename)
+        # 复制文件到 data 目录
+        if os.path.abspath(path) != os.path.abspath(dest):
+            shutil.copy2(path, dest)
         paths = self.get_file_list()
-        if path not in paths:
-            paths.append(path)
+        if filename not in paths:
+            paths.append(filename)
             self._save_file_list(paths)
         return paths
 
@@ -375,6 +532,7 @@ HTML = r"""<!DOCTYPE html>
       <button id="edit-btn">编辑内容</button>
       <button id="add-btn">浏览添加</button>
       <button id="del-btn" class="del-btn">删除</button>
+      <button id="jp-btn" style="display:none;">整活</button>
     </div>
   </div>
 <script>
@@ -394,6 +552,10 @@ HTML = r"""<!DOCTYPE html>
   var currentNameSize = { fs: 16.5, lh: 30 };  // 当前名字字号（vh），初始 30vh×0.55
   var voiceEnabled = true;  // 语音朗读开关
   var voiceBtn = document.getElementById('voice-btn');
+  var jpEnabled = false;  // 整活模式（日语朗读）
+  var jpBtn = document.getElementById('jp-btn');
+  var voiceTapCount = 0;      // 连点"语音"计数
+  var voiceTapTimer = null;   // 连点判定窗口
 
   var DESCRIPTIONS = {
     normal:  '完全随机抽取，可能连续抽到同一人',
@@ -436,19 +598,58 @@ HTML = r"""<!DOCTYPE html>
     window.pywebview.api.toggle_fullscreen();
   });
 
-  // 语音朗读
+  // 语音朗读开关（整活开启时仍保留完整功能）
   voiceBtn.addEventListener('click', function () {
     voiceEnabled = !voiceEnabled;
     voiceBtn.textContent = voiceEnabled ? ' 语音' : '静音';
     voiceBtn.style.opacity = voiceEnabled ? '1' : '0.5';
+    // 连点三下"语音"：在名单选择界面显示隐藏的"整活"选项
+    voiceTapCount++;
+    clearTimeout(voiceTapTimer);
+    voiceTapTimer = setTimeout(function () { voiceTapCount = 0; }, 600);
+    if (voiceTapCount >= 3) {
+      voiceTapCount = 0;
+      clearTimeout(voiceTapTimer);
+      jpBtn.style.display = '';
+    }
   });
+
+  // 整活模式（日语朗读中文名字）
+  function setJpEnabled(on) {
+    jpEnabled = on;
+    if (on) {
+      jpBtn.textContent = '关闭';
+      jpBtn.style.display = '';
+    } else {
+      jpBtn.textContent = '整活';
+      jpBtn.style.display = 'none';
+    }
+  }
+  jpBtn.addEventListener('click', function () {
+    setJpEnabled(!jpEnabled);
+  });
+
+  // 预加载语音列表（异步）
+  var cachedVoices = [];
+  if (window.speechSynthesis) {
+    cachedVoices = window.speechSynthesis.getVoices();
+    window.speechSynthesis.onvoiceschanged = function () {
+      cachedVoices = window.speechSynthesis.getVoices();
+    };
+  }
 
   function speak(text) {
     if (!voiceEnabled || !window.speechSynthesis) return;
     window.speechSynthesis.cancel();
     var u = new SpeechSynthesisUtterance(text);
-    // 检测是否包含中文
-    if (/[\u4e00-\u9fff]/.test(text)) {
+    if (jpEnabled) {
+      // 尝试找日语语音
+      var jpVoice = cachedVoices.find(function (v) { return v.lang.indexOf('ja') === 0; });
+      if (jpVoice) {
+        u.voice = jpVoice;
+      }
+      u.lang = 'ja-JP';
+    } else if (/[\u4e00-\u9fff]/.test(text)) {
       u.lang = 'zh-CN';
     } else {
       u.lang = 'en-US';
@@ -649,14 +850,38 @@ HTML = r"""<!DOCTYPE html>
 
 
 if __name__ == '__main__':
-    api = Api()
-    window = webview.create_window(
-        '随机点名工具',
-        html=HTML,
-        js_api=api,
-        width=1000,
-        height=750,
-        fullscreen=False,  # 默认窗口化，Esc 或"全屏 / 窗口"按钮切全屏
-    )
-    api.set_window(window)
-    webview.start()
+    log_env()
+    # 单实例检查：已有实例在运行则立即退出
+    if not _instance_lock.acquire():
+        log('已有主程序实例在运行，本次启动退出', level='WARN')
+        # 已有实例在运行，提示一下再退出
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, '程序已在运行', '随机点名工具', 0x40)
+        except Exception as e:
+            log(f'弹出提示框失败：{e}', level='WARN')
+        sys.exit(0)
+
+    # 正常退出 / 异常终止时释放 Mutex，避免残留死锁
+    atexit.register(_instance_lock.release)
+
+    try:
+        api = Api()
+        window = webview.create_window(
+            '随机点名工具',
+            html=HTML,
+            js_api=api,
+            width=1000,
+            height=750,
+            fullscreen=False,  # 默认窗口化，Esc 或"全屏 / 窗口"按钮切全屏
+        )
+        api.set_window(window)
+        log('窗口已创建，进入主循环')
+        webview.start()
+    except Exception as e:
+        log_exc(f'主程序异常退出：{e}')
+        raise
+    finally:
+        _instance_lock.release()
+        log('主程序已退出')
