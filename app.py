@@ -327,6 +327,41 @@ class Api:
         self.avoid_choice.append(name)
         return name
 
+    def choose_multi(self, count):
+        """多人点名：随机抽取 count 个不重复名字"""
+        names = self.get_names()
+        if not names:
+            return {'ok': False, 'msg': '名单为空'}
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return {'ok': False, 'msg': '人数格式错误'}
+        if count < 1:
+            return {'ok': False, 'msg': '人数必须大于 0'}
+        if count > len(names):
+            return {'ok': False, 'msg': f'抽取人数超过名单人数（{len(names)} 人）'}
+        picked = random.sample(names, count)
+        return {'ok': True, 'names': picked}
+
+    def create_groups(self, groups, per_group):
+        """随机分组：groups 组、每组 per_group 人，无重复且符合参数"""
+        names = self.get_names()
+        if not names:
+            return {'ok': False, 'msg': '名单为空'}
+        try:
+            groups = int(groups)
+            per_group = int(per_group)
+        except (TypeError, ValueError):
+            return {'ok': False, 'msg': '分组参数格式错误'}
+        if groups < 1 or per_group < 1:
+            return {'ok': False, 'msg': '分组数量和每组人数必须大于 0'}
+        if groups * per_group > len(names):
+            return {'ok': False, 'msg': f'需要 {groups * per_group} 人，名单只有 {len(names)} 人'}
+        pool = random.sample(names, groups * per_group)
+        result = [pool[i * per_group:(i + 1) * per_group]
+                  for i in range(groups)]
+        return {'ok': True, 'groups': result}
+
 
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -435,6 +470,14 @@ HTML = r"""<!DOCTYPE html>
     gap: 2.5vw;
     margin: 2vh auto 0;
   }
+  /* 全局工具栏：全屏/语音键在所有模式下可见 */
+  .global-bar {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 1vw;
+    margin: 0 auto 1.2vh;
+  }
   select {
     padding: 1.2vh 2.5vw;
     font-size: 2.2vh;
@@ -508,24 +551,154 @@ HTML = r"""<!DOCTYPE html>
   .file-mgr button:hover { opacity: 0.9; }
   .file-mgr button:active { opacity: 0.7; }
   .file-mgr .del-btn { color: rgba(255, 150, 150, 0.7); }
+  /* 选项卡栏：标题与显示区之间 */
+  .tabs {
+    display: flex;
+    justify-content: center;
+    gap: 1.2vw;
+    margin: 0 auto 1.8vh;
+  }
+  .tab {
+    padding: 0.9vh 3vw;
+    font-size: 2.6vh;
+    letter-spacing: 0.5vh;
+    color: rgba(255, 255, 255, 0.8);
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 3vh;
+    cursor: pointer;
+    box-shadow: none;
+    transition: background 0.2s, color 0.2s, transform 0.15s;
+  }
+  .tab:hover { color: #fff; background: rgba(255, 255, 255, 0.28); }
+  .tab.active {
+    color: #5b4a9a;
+    background: #fff;
+    font-weight: bold;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+  }
+  /* 参数输入行（多人/分组） */
+  .param-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 1vw;
+    margin: 2vh auto 1.5vh;
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 2.2vh;
+    letter-spacing: 0.15vh;
+  }
+  .param-row input {
+    width: 7vw;
+    padding: 0.9vh 1vw;
+    font-size: 2.4vh;
+    text-align: center;
+    color: #5b4a9a;
+    background: #fff;
+    border: none;
+    border-radius: 2vh;
+    outline: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  }
+  .param-row .go-btn {
+    padding: 1.1vh 2.5vw;
+    font-size: 2.4vh;
+    letter-spacing: 0.4vh;
+    color: #fff;
+    background: linear-gradient(135deg, #ff9a44 0%, #fc6076 100%);
+    border: none;
+    border-radius: 3vh;
+    cursor: pointer;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.22);
+    transition: transform 0.15s, opacity 0.15s;
+  }
+  .param-row .go-btn:hover { transform: translateY(-2px); }
+  .param-row .go-btn:active { transform: scale(0.96); }
+  /* 结果展示区 */
+  .result {
+    margin: 1vh auto 0;
+    min-height: 10vh;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 1.2vh;
+  }
+  .result .name-chip {
+    padding: 1.2vh 2.2vw;
+    font-size: 3.4vh;
+    color: #4a4a6a;
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 2vh;
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.22);
+    animation: reveal 0.45s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+  }
+  .result .group-card {
+    padding: 1.2vh 1.8vw;
+    font-size: 2.6vh;
+    color: #4a4a6a;
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 2vh;
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.22);
+    animation: reveal 0.45s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+  }
+  .result .group-card .g-title {
+    font-size: 2.2vh;
+    font-weight: bold;
+    color: #667eea;
+    margin-bottom: 0.4vh;
+    letter-spacing: 0.2vh;
+  }
+  .result .err-msg {
+    font-size: 2.2vh;
+    letter-spacing: 0.15vh;
+    color: rgba(255, 215, 160, 0.95);
+  }
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>随 机 点 名</h1>
-    <div id="display" class="display"></div>
-    <div class="controls">
-      <button id="btn" disabled>名单加载中...</button>
-      <select id="mode">
-        <option value="normal" selected>普通模式</option>
-        <option value="balance">平衡模式</option>
-        <option value="dedup">去重模式</option>
-      </select>
+    <div class="tabs">
+      <button class="tab active" data-tab="single">单人</button>
+      <button class="tab" data-tab="multi">多人</button>
+      <button class="tab" data-tab="group">分组</button>
+    </div>
+    <div class="global-bar">
       <button id="fsbtn" class="fs-btn">全屏 / 窗口</button>
       <button id="voice-btn" class="fs-btn" title="朗读点名结果"> 语音</button>
     </div>
-    <div id="mode-desc" class="mode-desc"></div>
-    <div id="count" class="count"></div>
+    <div id="single-panel">
+      <div id="display" class="display"></div>
+      <div class="controls">
+        <button id="btn" disabled>名单加载中...</button>
+        <select id="mode">
+          <option value="normal" selected>普通模式</option>
+          <option value="balance">平衡模式</option>
+          <option value="dedup">去重模式</option>
+        </select>
+      </div>
+      <div id="mode-desc" class="mode-desc"></div>
+      <div id="count" class="count"></div>
+    </div>
+    <div id="multi-panel" class="panel" style="display:none;">
+      <div class="param-row">
+        <label>抽取人数</label>
+        <input type="number" id="multi-count" min="1" value="1">
+        <button class="go-btn" id="multi-btn">开始抽取</button>
+      </div>
+      <div id="multi-result" class="result"></div>
+    </div>
+    <div id="group-panel" class="panel" style="display:none;">
+      <div class="param-row">
+        <label>分组数量</label>
+        <input type="number" id="group-num" min="1" value="2">
+        <label>每组人数</label>
+        <input type="number" id="group-per" min="1" value="2">
+        <button class="go-btn" id="group-btn">开始分组</button>
+      </div>
+      <div id="group-result" class="result"></div>
+    </div>
     <div class="file-mgr">
       <select id="file-select" title="选择名单文件"></select>
       <button id="new-btn">新名单</button>
@@ -556,6 +729,11 @@ HTML = r"""<!DOCTYPE html>
   var jpBtn = document.getElementById('jp-btn');
   var voiceTapCount = 0;      // 连点"语音"计数
   var voiceTapTimer = null;   // 连点判定窗口
+  // 选项卡：单人 / 多人 / 分组
+  var tabs = document.querySelectorAll('.tabs .tab');
+  var singlePanel = document.getElementById('single-panel');
+  var multiPanel = document.getElementById('multi-panel');
+  var groupPanel = document.getElementById('group-panel');
 
   var DESCRIPTIONS = {
     normal:  '完全随机抽取，可能连续抽到同一人',
@@ -773,6 +951,75 @@ HTML = r"""<!DOCTYPE html>
     loadFileList();
     reloadNames();
   }
+
+  // ---- 选项卡切换：单人 / 多人 / 分组 ----
+  function switchTab(name) {
+    tabs.forEach(function (t) {
+      t.classList.toggle('active', t.getAttribute('data-tab') === name);
+    });
+    singlePanel.style.display = (name === 'single') ? '' : 'none';
+    multiPanel.style.display = (name === 'multi') ? '' : 'none';
+    groupPanel.style.display = (name === 'group') ? '' : 'none';
+  }
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () {
+      switchTab(t.getAttribute('data-tab'));
+    });
+  });
+
+  // 多人点名
+  document.getElementById('multi-btn').addEventListener('click', function () {
+    var n = parseInt(document.getElementById('multi-count').value, 10);
+    if (!n || n < 1) { n = 1; }
+    window.pywebview.api.choose_multi(n).then(function (res) {
+      var box = document.getElementById('multi-result');
+      if (!res || !res.ok) {
+        box.innerHTML = '<div class="err-msg">' + (res.msg || '抽取失败') + '</div>';
+        return;
+      }
+      box.innerHTML = '';
+      res.names.forEach(function (nm, i) {
+        var el = document.createElement('span');
+        el.className = 'name-chip';
+        el.style.animationDelay = (i * 0.12) + 's';
+        el.textContent = nm;
+        box.appendChild(el);
+      });
+      speak(res.names.map(function (nm) { return nm + '被选中'; }).join('，'));
+    });
+  });
+
+  // 随机分组
+  document.getElementById('group-btn').addEventListener('click', function () {
+    var g = parseInt(document.getElementById('group-num').value, 10);
+    var p = parseInt(document.getElementById('group-per').value, 10);
+    if (!g || g < 1) { g = 1; }
+    if (!p || p < 1) { p = 1; }
+    window.pywebview.api.create_groups(g, p).then(function (res) {
+      var box = document.getElementById('group-result');
+      if (!res || !res.ok) {
+        box.innerHTML = '<div class="err-msg">' + (res.msg || '分组失败') + '</div>';
+        return;
+      }
+      box.innerHTML = '';
+      var spoken = [];
+      res.groups.forEach(function (members, i) {
+        var card = document.createElement('div');
+        card.className = 'group-card';
+        card.style.animationDelay = (i * 0.12) + 's';
+        var title = document.createElement('div');
+        title.className = 'g-title';
+        title.textContent = '第 ' + (i + 1) + ' 组';
+        var body = document.createElement('div');
+        body.textContent = members.join('、');
+        card.appendChild(title);
+        card.appendChild(body);
+        box.appendChild(card);
+        spoken.push('第' + (i + 1) + '组：' + members.join('、'));
+      });
+      speak(spoken.join('。'));
+    });
+  });
 
   function randomName() {
     return names[Math.floor(Math.random() * names.length)];
