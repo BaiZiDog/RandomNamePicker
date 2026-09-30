@@ -262,14 +262,18 @@ def classify_replace_log_line(line):
     返回 'ok' / 'fail' / 'skip' / 'mark' / 'end' / 'rollback' / 'batch' /
     ''（无关行）。仅 [OK]/[FAIL] 计入进度；[MARK]（helper.exe 标记行）
     不计数 —— 该行旧版用 [OK] 前缀，导致幽灵 +1、窗口提前收尾。
+
+    匹配锚定在日志的"级别字段"上（`] [OK]` 形式），而不是裸子串：
+    文件相对路径或规则描述里若含 "[OK]" 字样，裸子串匹配会把一条
+    [FAIL] 行误判为 ok，导致计数错乱、窗口提前收尾。
     """
-    if '[OK]' in line:
+    if '] [OK]' in line:
         return 'ok'
-    if '[FAIL]' in line:
+    if '] [FAIL]' in line:
         return 'fail'
-    if '[SKIP]' in line:
+    if '] [SKIP]' in line:
         return 'skip'
-    if '[MARK]' in line:
+    if '] [MARK]' in line:
         return 'mark'
     if '延时替换结束' in line:
         return 'end'
@@ -1056,6 +1060,7 @@ def safe_extract(zip_path, target_dir):
     这样即使目标文件被占用，也不影响解压本身，替换交给退出后的批处理。
 
     返回 (替换清单, 跳过清单, 删除清单)，均为 [(相对路径, 规则说明)]。
+    解压失败的文件不计入任何清单，但会写入日志；调用方需据此判定失败。
     """
     abs_target = _abs(target_dir)
     staging = os.path.join(BASE_DIR, STAGING_DIR)
@@ -1075,6 +1080,7 @@ def safe_extract(zip_path, target_dir):
 
         # 解压到暂存目录（不碰目标文件，避免占用问题）
         extracted = []
+        failed = []
         for info in zf.infolist():
             if info.is_dir():
                 continue
@@ -1082,9 +1088,15 @@ def safe_extract(zip_path, target_dir):
                 zf.extract(info, staging)
                 extracted.append(info.filename.replace('/', os.sep))
             except OSError as e:
+                # 解压失败的文件不会进入清单，也就不会被批处理计为 FAIL。
+                # 必须单独记录：否则主程序会因漏装文件而损坏却"更新成功"。
+                failed.append(info.filename)
                 log(f'解压 {info.filename} 到暂存失败：{e}', level='WARN')
 
-    log(f'暂存解压完成：{len(extracted)} 个文件', level='DEBUG')
+    log(f'暂存解压完成：{len(extracted)} 个文件'
+        + (f'，失败 {len(failed)} 个：{failed}' if failed else ''))
+    if failed:
+        raise Exception(f'解压失败 {len(failed)} 个文件：{failed}')
 
     # 按规则分类
     to_replace, to_skip, to_delete = classify_files(extracted)
@@ -1125,6 +1137,11 @@ def rollback(backup_path):
     cleared = 0
     for item in os.listdir(BASE_DIR):
         if item == BACKUP_DIR_NAME:
+            continue
+        # 与 KEEP_ITEMS 语义一致：data（用户名单）与 helper.exe 绝不删除。
+        # 若备份阶段 data 被占用跳过，清空后无法还原 -> 用户数据永久丢失。
+        if item.lower() in KEEP_ITEMS:
+            log(f'  跳过保留项：{item}', level='DEBUG')
             continue
         path = os.path.join(BASE_DIR, item)
         if _is_running_self(path):
@@ -1450,19 +1467,31 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         f'  goto :no_rollback',
         ')',
         '',
-        # 1. 清空当前目录（保留 _backup、helper.log、回滚标记）
+        # 1. 清空当前目录（保留 _backup、data、helper.log、回滚标记）
+        #    data 是用户名单数据目录，必须与 KEEP_ITEMS 语义一致地保护：
+        #    若备份阶段 data 被占用跳过，清空后 xcopy 无法还原 -> 用户数据永久丢失。
         f'echo [%date% %time%] 回滚步骤 1/2：清空当前文件 >> "%LOG%"',
         f'for /d %%D in ("%BASE%\\*") do (',
-        f'  if /i not "%%~nxD"=="{BACKUP_DIR_NAME}" rmdir /s /q "%%D" >nul 2>&1',
+        f'  if /i not "%%~nxD"=="{BACKUP_DIR_NAME}" '
+        f'if /i not "%%~nxD"=="data" rmdir /s /q "%%D" >nul 2>&1',
         ')',
         f'for %%F in ("%BASE%\\*") do (',
         f'  if /i not "%%~nxF"=="helper.log" '
-        f'if /i not "%%~nxF"=="{REPLACE_REPORT}" del /f /q "%%F" >nul 2>&1',
+        f'if /i not "%%~nxF"=="{REPLACE_REPORT}" '
+        f'if /i not "%%~nxF"=="app.zip" del /f /q "%%F" >nul 2>&1',
         ')',
         '',
         # 2. 从备份还原
         f'echo [%date% %time%] 回滚步骤 2/2：从备份还原 >> "%LOG%"',
         f'xcopy /e /i /y /q "{_bat_escape(backup_root)}\\*" "%BASE%\\" >nul 2>&1',
+        # xcopy 失败检测：返回码被 >nul 丢弃，若不检测会"假回滚"
+        # （日志写"回滚完成"但文件未还原，用户看到已回滚却处于半损坏状态）
+        'if errorlevel 1 (',
+        f'  echo [%date% %time%] [WARN] 回滚还原不完整（xcopy 失败），请检查文件 >> "%LOG%"',
+        '  set /a ROLLBACK_INCOMPLETE=1',
+        ') else (',
+        f'  echo [%date% %time%] 回滚还原完成 >> "%LOG%"',
+        ')',
         '',
         # 写入回滚标记（进度窗口据此识别）
         f'echo rollback > "%BASE%\\{REPLACE_ROLLBACK_FLAG}"',
@@ -1575,6 +1604,10 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         f'  echo 结果: 更新失败，已回滚到更新前状态 >> "%REPORT%"',
         f'  echo 备份保留在: {_bat_escape(BACKUP_DIR_NAME)} >> "%REPORT%"',
         ')',
+        # 回滚还原不完整时明确标注，避免用户误以为已完全恢复
+        'if defined ROLLBACK_INCOMPLETE (',
+        f'  echo [警告] 回滚还原不完整，部分文件可能未恢复，请检查 >> "%REPORT%"',
+        ')',
         f'echo. >> "%REPORT%"',
         f'echo 详细日志见: helper.log >> "%REPORT%"',
         # 不再自删批处理（del "%~f0"）：cmd 逐行读取 bat，执行中删除自身会在
@@ -1609,9 +1642,16 @@ def schedule_cleanup(delete_backup, target_exe):
 
     log(f'延时替换检查：待替换={len(items)} 项 | 删备份={has_backup}')
 
-    if not items and not has_backup:
-        # 无任务：顺手清掉可能残留的空清单，杜绝下次误触发
+    if not items:
+        # 无待替换项：一律不调度（返回 False 让调用方直接启动主程序）。
+        # 注意不能写成 "not items and not has_backup" —— 那样在"清单为空但
+        # 备份仍在"时会返回 True，而 _flush_pending_replace() 对 total<=0
+        # 直接 return，批处理与进度窗口都不会启动，导致主程序永不启动。
         _remove_manifest(manifest_path)
+        if has_backup:
+            # 无替换任务却残留备份：顺手清掉，避免 _backup 永久占用磁盘
+            shutil.rmtree(backup_root, ignore_errors=True)
+            log(f'无待替换项，已清理残留备份：{backup_root}', level='WARN')
         log('无需调度延时替换', level='DEBUG')
         return False
 
@@ -1721,6 +1761,11 @@ class ReplaceProgressWindow:
         self.finished = False
         self.rolling_back = False
         self.rolled_back = False
+        # 是否已收到批处理的结束标志（"延时替换结束"）。
+        # 兜底收尾必须等它出现：失败时 done+failed 会在批处理写回滚标志
+        # 之前就达到 total，若据此提前收尾，窗口会误判为"更新完成"并
+        # 启动半损坏的主程序，与正在进行的回滚竞争。
+        self.saw_end = False
         # 只统计本批次新增日志：历史 [OK]/[FAIL] 行不得计入，
         # 否则计数虚高会导致窗口提前收尾（launch 旧主程序）。
         if log_pos > 0:
@@ -1795,6 +1840,7 @@ class ReplaceProgressWindow:
             elif kind == 'end':
                 # 批处理已打印结束标志：准确感知替换完成（不依赖批处理自删事件，
                 # 即使 del "%~f0" 失败也能正常收尾，避免与清理阶段循环等待）
+                self.saw_end = True
                 self._finish()
                 return
 
@@ -1805,8 +1851,10 @@ class ReplaceProgressWindow:
             text=f'{self.done + self.failed} / {self.total}'
                  + (f'（失败 {self.failed}）' if self.failed else ''))
 
-        # 兜底结束条件：所有文件都已计数（结束标志丢失时也能收尾）
-        if (self.done + self.failed) >= self.total:
+        # 兜底结束条件：所有文件都已计数【且】已收到结束标志时才收尾。
+        # 不能只看计数 —— 失败时 done+failed 会在批处理写回滚标志之前
+        # 就达到 total，提前收尾会误判为"更新完成"并启动半损坏的主程序。
+        if (self.done + self.failed) >= self.total and self.saw_end:
             self._finish()
             return
 
@@ -1831,7 +1879,9 @@ class ReplaceProgressWindow:
         else:
             self.status.config(text='更新完成，正在启动程序...', fg='#7ee787')
 
-        self.detail.config(text=f'{self.done} / {self.total}')
+        self.detail.config(
+            text=f'{self.done + self.failed} / {self.total}'
+                 + (f'（失败 {self.failed}）' if self.failed else ''))
         self.root.update_idletasks()
         self.root.after(REPLACE_WIN_LAUNCH_DELAY_MS, self._launch)
 
