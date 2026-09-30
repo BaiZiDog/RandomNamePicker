@@ -2,19 +2,20 @@
 """Helper 更新程序 —— 图形界面版启动器
 
 检查 GitHub Release 更新，应用后启动主程序。
-版本判定：比较本地版本与 GitHub 最新 release 对应 tag 的 commit 时间。
+版本判定：从 releases.atom（公开 XML，不走 API 配额）读取最新 tag，
+与本地版本号做版本号比较（v{M}.{N} 或 v{M}.{N}.{字母补丁}）。
 
 更新策略：
-  1. 全量备份 BASE_DIR 到 _backup（仅用于失败回滚）
-  2. 删除 BASE_DIR 中除 KEEP_ITEMS、_backup、helper.log 之外的所有内容
-  3. 解压新包到 _staging 暂存目录，按规则分类（替换/跳过/删除）
-  4. 任一步失败 -> 用 _backup 回滚
-  5. 更新成功 -> 退出后由 _replace.bat 分批替换文件并删除 _backup
+  1. 版本检查：releases.atom 取最新 tag，与 LOCAL_VERSION 做版本号比较
+  2. 下载 app.zip（代理兜底 + 分块多线程）
+  3. 全量备份 BASE_DIR 到 _backup（仅用于失败回滚）
+  4. 待替换内容统一改名 *.old（不直接删除，规避占用），新包解压到 _staging
+  5. 任一步失败 -> 用 _backup 回滚；成功 -> helper 退出后由 _replace.bat
+     分批替换文件、清理残留并删除 _backup
 """
 import os
 import sys
 import re
-import json
 import time
 import socket
 import atexit
@@ -24,17 +25,26 @@ import subprocess
 import shutil
 import threading
 import urllib.request
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk
 
 GITHUB_REPO = 'BaiZiDog/RandomNamePicker'
+# releases.atom：公开 XML 源，不占用 API 配额。
+# API 未认证请求按 IP 限速 60 次/小时，反复调试或多次启动就会耗尽（HTTP 403）。
+RELEASES_ATOM_URL = f'https://github.com/{GITHUB_REPO}/releases.atom'
+# 更新包文件名的固定约定（atom 不含资产列表，按 tag 直接拼下载地址）
+ZIP_ASSET_NAME = 'app.zip'
+# 获取最新 tag 的单源超时（秒）：元数据请求很小，超时设短些，
+# 某个源不可用时不至于让启动卡上十几秒
+ATOM_TIMEOUT = 8
 BASE_DIR = os.path.dirname(os.path.abspath(
     sys.executable if getattr(sys, 'frozen', False) else __file__
 ))
 MAIN_EXE = os.path.join(BASE_DIR, 'RandomNamePicker.exe')
 
 # 当前版本号（硬编码，每次发版时同步更新）
-LOCAL_VERSION = 'v1.5-fix'
+LOCAL_VERSION = 'v2.0'
 
 # 更新时保留在根目录的内容（不会被删除、不会被覆盖）
 KEEP_ITEMS = {'helper.exe', 'data'}
@@ -70,8 +80,6 @@ CHUNK_SIZE = 2 * 1024 * 1024                  # 2 MB
 # 线程数上下限
 MIN_THREADS = 2
 MAX_THREADS = 16
-# 动态调整：连续多少次分片失败后减少线程
-THREAD_SHRINK_AFTER_FAILS = 2
 # 常规请求超时（秒）：API 请求、探测等通用
 DOWNLOAD_TIMEOUT = 60
 # 分片下载失败重试次数
@@ -81,8 +89,6 @@ CHUNK_RETRY = 3
 STALL_TIMEOUT = 20
 # 龟速判定：低于该速度（字节/秒）持续 STALL_TIMEOUT 秒则判定为"过慢"
 MIN_SPEED = 30 * 1024
-# 是否启用 SHA256 完整性校验（从 GitHub API 资源的 digest 字段取值）
-SHA256_VERIFY = True
 
 # ---------------------------------------------------------------------------
 # 延时批处理替换配置
@@ -237,6 +243,43 @@ def read_log_lines(path, start=0):
     return lines, new_pos
 
 
+def _log_size(path):
+    """返回日志文件当前字节大小（进度窗口的起读偏移）。
+
+    进度窗口只应统计"本次"替换结果：helper.log 跨会话保留，
+    历史 [OK]/[FAIL] 行若被计入会让窗口虚增完成数、提前收尾。
+    父进程在启动批处理前捕获偏移并传给窗口，保证只读本批次新增行。
+    """
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def classify_replace_log_line(line):
+    """把替换日志行归类，供进度窗口统计与展示。
+
+    返回 'ok' / 'fail' / 'skip' / 'mark' / 'end' / 'rollback' / 'batch' /
+    ''（无关行）。仅 [OK]/[FAIL] 计入进度；[MARK]（helper.exe 标记行）
+    不计数 —— 该行旧版用 [OK] 前缀，导致幽灵 +1、窗口提前收尾。
+    """
+    if '[OK]' in line:
+        return 'ok'
+    if '[FAIL]' in line:
+        return 'fail'
+    if '[SKIP]' in line:
+        return 'skip'
+    if '[MARK]' in line:
+        return 'mark'
+    if '延时替换结束' in line:
+        return 'end'
+    if '回滚' in line:
+        return 'rollback'
+    if '批次' in line and '---' in line:
+        return 'batch'
+    return ''
+
+
 def _mark_mei():
     """在自身临时解压目录（sys._MEIPASS）写标记文件。
 
@@ -295,6 +338,50 @@ def cleanup_stale_mei():
             log(f'已清理残留临时目录：{name}', level='WARN')
         except OSError as e:
             log(f'清理残留临时目录失败（下次再试）：{name}：{e}', level='DEBUG')
+
+
+def cleanup_stale_replace_files():
+    """清理上次异常中断残留的替换状态文件与暂存目录。
+
+    背景：_replace_manifest.txt 曾"只写不删"，残留清单会让下次启动
+    误判为有替换任务 —— 即使本次"已是最新版本"，也会跑延时替换批处理，
+    把 helper.exe 改名 .old 后当垃圾清掉，且无 _backup 可回滚。
+
+    安全前提：只有"批处理与 _staging 同时存在"才跳过 —— 那才可能是进行中的
+    替换（批处理会把 _staging 里的文件搬到目标位置，此时删 _staging 会让
+    替换因"暂存缺失"失败并触发回滚）。
+    批处理正常结束会自删，且删除 _staging 后还要跑清理段；因此
+    "批处理在但 _staging 不在"说明替换已过搬运阶段或根本没跑起来，
+    残留的状态文件可以安全清理，不会出现"一个残留 bat 永久挡住兜底"。
+
+    跨进程/跨阶段的状态文件必须明确"谁写、谁读、谁删、何时删"：
+      写：safe_extract()  →  读：schedule_cleanup()  →  删：生成 bat 后立即删
+      本函数是"异常中断导致漏删"时的兜底。
+    """
+    bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
+    staging = os.path.join(BASE_DIR, STAGING_DIR)
+    if os.path.exists(bat_path) and os.path.isdir(staging):
+        log('疑似替换仍在进行（批处理与暂存目录同时存在），跳过残留清理', level='WARN')
+        return
+
+    for path, desc in (
+        (os.path.join(BASE_DIR, REPLACE_MANIFEST), '替换清单'),
+        (os.path.join(BASE_DIR, REPLACE_ROLLBACK_FLAG), '回滚标志'),
+        (os.path.join(REPLACE_BAT_DIR, REPLACE_WINDOW_READY_FLAG), '窗口就绪标志'),
+    ):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                log(f'已清理残留{desc}：{path}', level='WARN')
+        except OSError as e:
+            log(f'清理残留{desc}失败：{e}', level='WARN')
+
+    try:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+            log(f'已清理残留暂存目录：{staging}', level='WARN')
+    except OSError as e:
+        log(f'清理残留暂存目录失败：{e}', level='WARN')
 
 
 # 注意：helper.py 不再负责删除 *.old 文件 —— 那属于【清理】阶段，
@@ -361,25 +448,21 @@ def log_env():
 # ---------------------------------------------------------------------------
 
 class SingleInstance:
-    """基于命名 Mutex 的跨进程单实例锁。
+    """基于 Windows 命名 Mutex 的跨进程单实例锁。
 
-    Windows 使用 CreateMutexW + GetLastError 判定；其他系统用文件锁模拟，
-    保证不同平台行为一致。获取失败即表示已有实例在运行。
+    CreateMutexW + GetLastError 判定。获取失败即表示已有实例在运行。
     """
 
     def __init__(self, name):
         self.name = name
         self._handle = None
-        self._lock_file = None
         self.acquired = False
 
     def acquire(self):
         """尝试获取所有权。成功返回 True，已有实例返回 False。"""
         log(f'尝试获取 Mutex：{self.name}', level='DEBUG')
         try:
-            if os.name == 'nt':
-                return self._acquire_windows()
-            return self._acquire_posix()
+            return self._acquire_windows()
         except Exception as e:
             # 出错时保守放行，避免因锁机制本身故障导致程序无法启动
             log_exc(f'Mutex 获取异常，放行启动：{e}')
@@ -410,24 +493,6 @@ class SingleInstance:
         log(f'Mutex 获取成功：{self.name}（句柄={handle}）')
         return True
 
-    def _acquire_posix(self):
-        import fcntl
-        import tempfile
-
-        safe = self.name.replace('\\', '_').replace('/', '_')
-        path = os.path.join(tempfile.gettempdir(), safe + '.lock')
-        self._lock_file = open(path, 'a+')
-        try:
-            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            self._lock_file.close()
-            self._lock_file = None
-            log(f'检测到已有实例运行（锁文件={path}）：{e}，退出', level='WARN')
-            return False
-        self.acquired = True
-        log(f'Mutex 获取成功：{path}')
-        return True
-
     def release(self):
         """释放 Mutex 资源，可重复调用。"""
         if self._handle is not None:
@@ -440,65 +505,113 @@ class SingleInstance:
                 log_exc(f'Mutex 释放失败：{e}')
             finally:
                 self._handle = None
-        if self._lock_file is not None:
-            try:
-                import fcntl
-                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
-                self._lock_file.close()
-                log(f'Mutex 已释放：{self.name}')
-            except Exception as e:
-                log_exc(f'Mutex 释放失败：{e}')
-            finally:
-                self._lock_file = None
         self.acquired = False
 
 
 _instance_lock = SingleInstance(MUTEX_NAME)
 
 
-def github_get(path):
-    url = f'https://api.github.com/repos/{GITHUB_REPO}{path}'
-    log(f'GitHub API 请求：{url}', level='DEBUG')
-    req = urllib.request.Request(url, headers={
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'RandomNamePicker-Helper',
-    })
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    log(f'GitHub API 响应：{url} -> HTTP {resp.status}', level='DEBUG')
-    return data
+def _candidate_urls(url, direct_first=False):
+    """候选请求地址：默认代理优先、直连兜底。
+
+    direct_first=True 时改为直连优先 —— 适用于 GitHub 加速代理不支持的
+    路径（实测 releases.atom 在代理上返回 404，白等超时），此时直连最快。
+    返回 [(源名, 地址), ...]。
+    """
+    candidates = [(p, p + url) for p in GITHUB_PROXIES]
+    direct = ('直连', url)
+    return [direct] + candidates if direct_first else candidates + [direct]
 
 
-def get_tag_commit_date(tag):
-    try:
-        ref = github_get(f'/git/refs/tags/{tag}')
-        sha = ref['object']['sha']
-        if ref['object']['type'] == 'tag':
-            tag_obj = github_get(f'/git/tags/{sha}')
-            sha = tag_obj['object']['sha']
-        commit = github_get(f'/git/commits/{sha}')
-        date = commit['committer']['date']
-        log(f'tag {tag} 提交时间：{date}（sha={sha[:8]}）', level='DEBUG')
-        return date
-    except Exception as e:
-        log_exc(f'获取 {tag} 时间失败：{e}')
+def _asset_url(tag, name):
+    """按 tag 直接拼资产下载地址。
+
+    atom 不含资产列表，因此下载地址由约定名拼出：
+      https://github.com/{repo}/releases/download/{tag}/{name}
+    """
+    return f'https://github.com/{GITHUB_REPO}/releases/download/{tag}/{name}'
+
+
+def get_latest_tag():
+    """从 releases.atom 获取最新 tag（取版本号最大者）。
+
+    为什么不用 API：未认证的 GitHub API 按 IP 限速 60 次/小时，
+    反复调试或用户多次启动就会耗尽，之后所有请求返回 403，
+    更新流程直接瘫痪。releases.atom 是公开 XML，无速率限制、无需 Token。
+
+    解析用命名空间无关的 tag 后缀匹配，避免 GitHub 改命名空间前缀时失效。
+
+    为什么不是"取第一条"：atom 条目按【创建/更新时间】倒序，而不是按版本。
+    实测把 v1.5-fix 重命名为 v1.5.a 后，旧版本立刻排到了第一条。
+    若据此判断"最新版本"，重新打过旧版本 tag 就会让助手看不到真正的新版本。
+    因此收集全部 tag、按版本号取最大者（无法解析的 tag 直接忽略）。
+
+    直连优先：实测 releases.atom 路径在加速代理上返回 404，代理优先会白等
+    超时（十几秒）；直连不可用时再回退代理。
+    """
+    for name, src in _candidate_urls(RELEASES_ATOM_URL, direct_first=True):
+        try:
+            log(f'获取最新版本（{name}）：{src}', level='DEBUG')
+            with _open_url(src, timeout=ATOM_TIMEOUT) as resp:
+                xml_bytes = resp.read()
+            root = ET.fromstring(xml_bytes)
+
+            tags = []
+            for entry in root.iter():
+                if not entry.tag.endswith('entry'):
+                    continue
+                for child in entry:
+                    if child.tag.endswith('title'):
+                        tag = (child.text or '').strip()
+                        if tag:
+                            tags.append(tag)
+                        break
+
+            if not tags:
+                log(f'atom 中没有 entry（来源={name}）', level='WARN')
+                continue
+
+            candidates = [(p, t) for t in tags for p in [_parse_version(t)] if p]
+            if not candidates:
+                log(f'atom 中的 tag 均不符合命名规则：{tags}', level='WARN')
+                continue
+            latest = max(candidates)[1]
+            log(f'atom 共 {len(tags)} 个 tag，版本号最大者为 {latest}'
+                f'（来源={name}）', level='DEBUG')
+            return latest
+        except Exception as e:
+            log(f'获取最新 tag 失败（来源={name}）：{e}', level='WARN')
+    log('所有来源均无法获取最新 tag', level='ERROR')
+    return None
+
+
+def _parse_version(s):
+    """解析版本号：v{M}.{N}[.{X}] -> (M, N, X)，失败返回 None。
+
+    X 是单字母补丁（a-z）；无补丁返回空串，空串在字符串比较中小于任何字母，
+    因此天然满足 '' < 'a' < 'b' < ... 的语义。
+    """
+    m = re.match(r'^v?(\d+)\.(\d+)(?:\.([A-Za-z]))?$', (s or '').strip())
+    if not m:
         return None
+    return int(m.group(1)), int(m.group(2)), (m.group(3) or '').lower()
 
 
-def get_latest_release():
-    try:
-        release = github_get('/releases/latest')
-        log(f'最新 release：tag={release.get("tag_name")} '
-            f'资源数={len(release.get("assets", []))}', level='DEBUG')
-        return release
-    except Exception as e:
-        log_exc(f'获取最新版本失败：{e}')
-        return None
+def _version_gt(a, b):
+    """判断版本 a 是否比 b 新：先比主版本，再比次版本，最后比字母补丁。
 
-
-def _proxy_url(url, proxy):
-    """把原始 GitHub URL 改写为代理 URL。"""
-    return proxy + url
+    约定：v{M}.{N} 或 v{M}.{N}.{X}，X 为单字母。补丁用满 z 后进位到
+    v{M}.{N+1}。任一版本号解析失败时返回 False（保守：不触发更新）。
+    """
+    pa, pb = _parse_version(a), _parse_version(b)
+    if not pa or not pb:
+        log(f'版本号无法解析，跳过比较：{a} / {b}', level='WARN')
+        return False
+    if pa[0] != pb[0]:
+        return pa[0] > pb[0]
+    if pa[1] != pb[1]:
+        return pa[1] > pb[1]
+    return pa[2] > pb[2]
 
 
 def _open_url(url, headers=None, timeout=DOWNLOAD_TIMEOUT):
@@ -532,8 +645,6 @@ def _is_timeout(e):
         return True
     if isinstance(e, urllib.error.URLError):
         return _is_timeout(e.reason)
-    if isinstance(e, OSError) and isinstance(e, TimeoutError):
-        return True
     return False
 
 
@@ -694,7 +805,7 @@ def _download_chunk(url, dest, start, end, progress_cb, lock, counter, watchdog)
 
 
 def _download_multi(url, dest, total, progress_cb, watchdog):
-    """多线程分块下载，线程数自适应并动态调整。"""
+    """多线程分块下载（分片并发，任一失败即整体中止）。"""
     threads_n = _calc_threads(total)
     log(f'启用多线程下载：{threads_n} 线程，分片 {CHUNK_SIZE // 1024 // 1024} MB，'
         f'总大小 {total / 1024 / 1024:.2f} MB')
@@ -705,8 +816,6 @@ def _download_multi(url, dest, total, progress_cb, watchdog):
 
     lock = threading.Lock()
     counter = [0]
-    fail_streak = [0]
-    active = [threads_n]          # 当前允许的并发数（动态调整用）
     sem = threading.Semaphore(threads_n)
     errors = []
 
@@ -728,17 +837,10 @@ def _download_multi(url, dest, total, progress_cb, watchdog):
                 with open(dest, 'r+b') as f:
                     _download_chunk(url, f, start, end, progress_cb,
                                     lock, counter, watchdog)
-                with lock:
-                    fail_streak[0] = 0
             except Exception as e:
                 with lock:
-                    fail_streak[0] += 1
-                    # 动态调整：连续失败则降低并发，减轻服务器压力
-                    if (fail_streak[0] >= THREAD_SHRINK_AFTER_FAILS
-                            and active[0] > MIN_THREADS):
-                        active[0] = max(MIN_THREADS, active[0] // 2)
-                        log(f'连续失败 {fail_streak[0]} 次，'
-                            f'并发降至 {active[0]}', level='WARN')
+                    # 分片内部已自含重试与备用源切换，走到这里即彻底失败，
+                    # 记录后中止其余任务（半成品文件由调用方删除）
                     errors.append(e)
 
     ts = []
@@ -748,8 +850,8 @@ def _download_multi(url, dest, total, progress_cb, watchdog):
         t = threading.Thread(target=worker, args=(start, end), daemon=True)
         t.start()
         ts.append(t)
-        # 动态调整：按当前允许的并发数节流
-        while sum(1 for x in ts if x.is_alive()) >= active[0]:
+        # 已启动线程数到达并发上限时等待，避免一次性创建全部线程
+        while sum(1 for x in ts if x.is_alive()) >= threads_n:
             if errors:
                 break
             time.sleep(0.05)
@@ -787,61 +889,27 @@ def _download_single(url, dest, total, progress_cb, watchdog):
     log(f'单线程下载完成：{done} 字节')
 
 
-def _sha256_file(path, chunk_size=1024 * 1024):
-    """计算文件的 SHA256 十六进制摘要。"""
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        while True:
-            b = f.read(chunk_size)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
-
-def _matches_sha256(path, digest):
-    """校验文件是否匹配给定 digest。
-
-    GitHub API 资源的 digest 字段形如 "sha256:xxxxxxxx"，
-    这里兼容带/不带 "sha256:" 前缀两种格式。
-    """
-    if not digest:
-        return True
-    expect = digest.lower()
-    if ':' in expect:
-        expect = expect.split(':', 1)[1]
-    try:
-        actual = _sha256_file(path).lower()
-    except OSError:
-        return False
-    return actual == expect
-
-
-def download_file(url, dest, progress_cb=None, sha256=None):
+def download_file(url, dest, progress_cb=None, size_cb=None):
     """下载文件：代理优先，全部失败回退直连；大文件多线程分块。
 
     progress_cb 接收"已下载字节数"（不是比例），由调用方换算。
+    size_cb 在探到文件总大小时被调用（atom 渠道拿不到文件大小，
+    进度条需要它来换算比例，否则分母恒为 0、进度条不动）。
     每个源都有速度看门狗（无进展/龟速判定），会自动切换下一个源。
-    下载完成后可选做 SHA256 完整性校验（sha256 参数传入 digest）。
     """
     log(f'开始下载：{url}')
     log(f'保存到：{dest}')
-    if sha256:
-        log(f'SHA256 校验：已启用（{sha256}）', level='DEBUG')
-
-    # 候选源：代理优先，直连作为最终兜底
-    candidates = [(p, _proxy_url(url, p)) for p in GITHUB_PROXIES]
-    candidates.append(('直连', url))
 
     last_err = None
-    for name, src in candidates:
+    for name, src in _candidate_urls(url):
         log(f'尝试下载源：{name} -> {src}')
         ok, total, support_range = _probe(src)
         if not ok:
             log(f'下载源不可用：{name}', level='WARN')
             continue
 
+        if size_cb and total > 0:
+            size_cb(total)
         log(f'下载源可用：{name} | 大小={total} 字节 '
             f'({total / 1024 / 1024:.2f} MB) | 支持 Range={support_range}')
 
@@ -859,12 +927,6 @@ def download_file(url, dest, progress_cb=None, sha256=None):
             size = os.path.getsize(dest)
             if total and size != total:
                 raise Exception(f'大小不符：期望 {total}，实际 {size}')
-
-            # 可选：SHA256 完整性校验
-            if SHA256_VERIFY and sha256:
-                log(f'正在校验 SHA256（{size} 字节）...', level='DEBUG')
-                if not _matches_sha256(dest, sha256):
-                    raise Exception('SHA256 校验失败，文件不完整或已损坏')
 
             elapsed = time.time() - t0
             speed = size / elapsed / 1024 if elapsed > 0 else 0
@@ -1186,6 +1248,21 @@ def _read_manifest():
     return items
 
 
+def _remove_manifest(manifest_path):
+    """删除替换清单，可重复调用。
+
+    清单只是"生成批处理的输入"，不是"运行批处理的状态"：
+    内容已编译进 bat，生成后必须立刻删除，否则残留清单会在下次
+    启动时被 _read_manifest() 读到，误判为有替换任务。
+    """
+    try:
+        if os.path.exists(manifest_path):
+            os.remove(manifest_path)
+            log(f'已删除替换清单：{manifest_path}', level='DEBUG')
+    except OSError as e:
+        log(f'删除替换清单失败：{e}', level='WARN')
+
+
 def _bat_escape(s):
     """转义批处理中的特殊字符。"""
     return s.replace('^', '^^').replace('%', '%%').replace('&', '^&') \
@@ -1282,7 +1359,7 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         '  ) else (',
         '    move /y "%SELFEXE%" "%SELFOLD%" >nul 2>&1',
         '    if not exist "%SELFEXE%" (',
-        f'      echo [%date% %time%] [OK] helper.exe 已标记为 {OLD_SUFFIX}（第 !DTRY! 次尝试） >> "%LOG%"',
+        f'      echo [%date% %time%] [MARK] helper.exe 已标记为 {OLD_SUFFIX}（第 !DTRY! 次尝试） >> "%LOG%"',
         '      set /a SELFDEL=1',
         '    ) else (',
         f'      if !DTRY! GEQ {REPLACE_MAX_RETRY} (',
@@ -1519,18 +1596,24 @@ def schedule_cleanup(delete_backup, target_exe):
     delete_backup: 是否删除 _backup（只有更新成功才为 True）
     target_exe:    当前 Helper 可执行文件路径（保留参数以兼容调用方）
 
+    返回：是否已调度替换任务。True 表示由批处理/进度窗口负责收尾
+    （进度窗口会在替换完成后启动主程序），调用方不应再直接启动主程序。
+
     批处理以独立 cmd 进程运行，由 main() 的退出路径 _flush_pending_replace()
     在 helper 关闭后启动（批处理自身还会先轮询等待主 Helper 进程消失）。
     """
     backup_root = os.path.join(BASE_DIR, BACKUP_DIR_NAME)
+    manifest_path = os.path.join(BASE_DIR, REPLACE_MANIFEST)
     items = _read_manifest()
     has_backup = delete_backup and os.path.isdir(backup_root)
 
     log(f'延时替换检查：待替换={len(items)} 项 | 删备份={has_backup}')
 
     if not items and not has_backup:
+        # 无任务：顺手清掉可能残留的空清单，杜绝下次误触发
+        _remove_manifest(manifest_path)
         log('无需调度延时替换', level='DEBUG')
-        return
+        return False
 
     # 批处理放在 BASE_DIR 之外：回滚时会用 for 循环清空 BASE_DIR，
     # 若批处理在里面会被自己删掉，导致后续步骤（xcopy 还原）无法执行。
@@ -1542,10 +1625,16 @@ def schedule_cleanup(delete_backup, target_exe):
         with open(bat_path, 'w', encoding='gbk') as f:
             f.write('\r\n'.join(lines) + '\r\n')
         log(f'已写入延时替换批处理：{bat_path}（{len(lines)} 行）', level='DEBUG')
+        # 清单内容已完整编译进批处理，生成后立即删除：
+        # 否则残留清单会在下次启动时被读到，误触发整套替换流程
+        # （把 helper.exe 改名 .old 后当垃圾清掉，且无备份可回滚）。
+        _remove_manifest(manifest_path)
         # 仅记录待启动，真正 Popen 交给 helper 关闭时的 _flush_pending_replace()
         _set_pending_replace(True, len(items))
+        return True
     except Exception as e:
         log_exc(f'写入延时替换批处理失败：{e}')
+        return False
 
 
 def _set_pending_replace(ready, total):
@@ -1571,7 +1660,8 @@ def _flush_pending_replace():
         return
 
     # 先拉起替换进度窗口（独立进程，替换完成后由它启动主程序）
-    _spawn_replace_window(total)
+    log_pos = _log_size(os.path.join(BASE_DIR, 'helper.log'))
+    _spawn_replace_window(total, log_pos)
 
     try:
         bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
@@ -1587,24 +1677,27 @@ def _flush_pending_replace():
         log_exc(f'调度延时替换失败：{e}')
 
 
-def _spawn_replace_window(total):
+def _spawn_replace_window(total, log_pos=0):
     """以独立进程启动替换进度窗口。
 
-    用 pythonw/自身 exe 加 --replace-window 参数启动，避免依赖控制台。
+    用自身 exe / pythonw 加 --replace-window 参数启动，避免依赖控制台。
+    log_pos 为 helper.log 的起读偏移（启动批处理前的字节大小），
+    保证窗口只统计本次替换产生的日志行。
     """
     if total <= 0:
         return
     try:
         if getattr(sys, 'frozen', False):
             # 打包后：用自身 exe 带参数启动
-            cmd = [sys.executable, '--replace-window', str(total)]
+            cmd = [sys.executable, '--replace-window', str(total), str(log_pos)]
         else:
             # 源码运行：用 pythonw 避免弹出控制台
             pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
             exe = pyw if os.path.exists(pyw) else sys.executable
-            cmd = [exe, os.path.abspath(__file__), '--replace-window', str(total)]
+            cmd = [exe, os.path.abspath(__file__), '--replace-window', str(total),
+                   str(log_pos)]
         subprocess.Popen(cmd, cwd=BASE_DIR)
-        log(f'已启动替换进度窗口（共 {total} 个文件）')
+        log(f'已启动替换进度窗口（共 {total} 个文件，日志起读偏移 {log_pos}）')
     except Exception as e:
         log_exc(f'启动替换进度窗口失败：{e}')
 
@@ -1616,11 +1709,11 @@ def _spawn_replace_window(total):
 class ReplaceProgressWindow:
     """替换进度窗口。
 
-    在 Helper 退出后由独立进程运行，实时读取 _replace.log 显示进度，
-    替换完成后自动启动主程序并关闭窗口。
+    在 Helper 退出后由独立进程运行，从 helper.log 的起读偏移开始
+    增量读取，显示本次替换进度，完成后自动启动主程序并关闭窗口。
     """
 
-    def __init__(self, total, main_exe):
+    def __init__(self, total, main_exe, log_pos=0):
         self.total = total
         self.main_exe = main_exe
         self.done = 0
@@ -1628,7 +1721,12 @@ class ReplaceProgressWindow:
         self.finished = False
         self.rolling_back = False
         self.rolled_back = False
-        self._log_pos = 0
+        # 只统计本批次新增日志：历史 [OK]/[FAIL] 行不得计入，
+        # 否则计数虚高会导致窗口提前收尾（launch 旧主程序）。
+        if log_pos > 0:
+            self._log_pos = log_pos
+        else:
+            self._log_pos = _log_size(os.path.join(BASE_DIR, 'helper.log'))
 
         self.root = tk.Tk()
         self.root.title(REPLACE_WIN_TITLE)
@@ -1679,24 +1777,22 @@ class ReplaceProgressWindow:
         self.log_box.config(state='disabled')
 
     def _poll(self):
-        """轮询 helper.log，更新进度。"""
+        """轮询 helper.log 增量，更新进度。"""
         log_path = os.path.join(BASE_DIR, 'helper.log')
         lines, self._log_pos = read_log_lines(log_path, self._log_pos)
         for line in lines:
-            if '[OK]' in line:
+            kind = classify_replace_log_line(line)
+            if kind == 'ok':
                 self.done += 1
                 self._append_log(line)
-            elif '[FAIL]' in line:
+            elif kind == 'fail':
                 self.failed += 1
                 self._append_log(line)
-            elif '[SKIP]' in line:
+            elif kind in ('skip', 'mark', 'rollback', 'batch'):
+                if kind == 'rollback':
+                    self.rolling_back = True
                 self._append_log(line)
-            elif '回滚' in line:
-                self.rolling_back = True
-                self._append_log(line)
-            elif '批次' in line and '---' in line:
-                self._append_log(line)
-            elif '延时替换结束' in line:
+            elif kind == 'end':
                 # 批处理已打印结束标志：准确感知替换完成（不依赖批处理自删事件，
                 # 即使 del "%~f0" 失败也能正常收尾，避免与清理阶段循环等待）
                 self._finish()
@@ -1709,12 +1805,8 @@ class ReplaceProgressWindow:
             text=f'{self.done + self.failed} / {self.total}'
                  + (f'（失败 {self.failed}）' if self.failed else ''))
 
-        # 判断是否结束：批处理已自删 或 全部处理完
-        bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
-        all_done = (self.done + self.failed) >= self.total
-        bat_gone = not os.path.exists(bat_path)
-
-        if all_done or (bat_gone and self.done + self.failed > 0):
+        # 兜底结束条件：所有文件都已计数（结束标志丢失时也能收尾）
+        if (self.done + self.failed) >= self.total:
             self._finish()
             return
 
@@ -1756,7 +1848,7 @@ class ReplaceProgressWindow:
         self.root.mainloop()
 
 
-def run_replace_window(total, main_exe):
+def run_replace_window(total, main_exe, log_pos=0):
     """以独立进程运行替换进度窗口。
 
     启动后立即写入"就绪标志"，批处理首段据此得知窗口已完成镜像加载
@@ -1767,7 +1859,7 @@ def run_replace_window(total, main_exe):
         ready_flag = os.path.join(REPLACE_BAT_DIR, REPLACE_WINDOW_READY_FLAG)
         with open(ready_flag, 'w', encoding='utf-8') as f:
             f.write(str(os.getpid()))
-        ReplaceProgressWindow(total, main_exe).run()
+        ReplaceProgressWindow(total, main_exe, log_pos).run()
     except Exception:
         pass
 
@@ -1892,45 +1984,25 @@ class HelperApp:
         log('=' * 60)
         log(f'开始检查更新 | 本地版本={LOCAL_VERSION}')
 
-        release = get_latest_release()
-        if not release:
-            log('无法连接 GitHub，跳过更新', level='WARN')
+        remote_tag = get_latest_tag()
+        if not remote_tag:
+            log('无法获取最新版本（atom 获取失败），跳过更新', level='WARN')
             self.root.after(0, lambda: self.set_status('无法连接 GitHub', '#ffb86c'))
             self.root.after(0, self.enable_start)
             return
 
-        remote_tag = release.get('tag_name', '')
         log(f'远端最新版本：{remote_tag}')
 
-        local_date = get_tag_commit_date(LOCAL_VERSION)
-        remote_date = get_tag_commit_date(remote_tag) if remote_tag else None
-        log(f'版本时间对比：本地={local_date} | 远端={remote_date}')
-
-        if local_date and remote_date and remote_date <= local_date:
-            log('已是最新版本，无需更新')
+        # 版本号比较（不走 API，无速率限制）
+        if not _version_gt(remote_tag, LOCAL_VERSION):
+            log(f'已是最新版本（本地 {LOCAL_VERSION} >= 远端 {remote_tag}）')
             self.root.after(0, lambda: self.set_status('已是最新版本', '#7ee787'))
             self.root.after(0, self.enable_start)
             return
 
-        zip_asset = None
-        for asset in release.get('assets', []):
-            if asset['name'] == 'app.zip':
-                zip_asset = asset
-                break
-        if not zip_asset:
-            for asset in release.get('assets', []):
-                if asset['name'].endswith('.zip'):
-                    zip_asset = asset
-                    break
-
-        if not zip_asset:
-            names = [a['name'] for a in release.get('assets', [])]
-            log(f'未找到更新包（app.zip），现有资源：{names}', level='WARN')
-            self.root.after(0, lambda: self.set_status('未找到更新包', '#ffb86c'))
-            self.root.after(0, self.enable_start)
-            return
-
-        log(f'选定更新包：{zip_asset["name"]}（{zip_asset.get("size", 0)} 字节）')
+        log(f'发现新版本：{LOCAL_VERSION} -> {remote_tag}')
+        zip_url = _asset_url(remote_tag, ZIP_ASSET_NAME)
+        log(f'更新包地址：{zip_url}')
 
         # 更新前先确保主程序已退出，否则主程序占用的 DLL 会导致清理失败
         if is_main_running():
@@ -1952,18 +2024,20 @@ class HelperApp:
         self.root.after(0, lambda: self.set_status(f'发现新版本 {remote_tag}，下载中...'))
         zip_path = os.path.join(BASE_DIR, 'app.zip')
         t = _t.time()
-        # 进度回调收到的是"已下载字节数"，这里换算成比例
-        total_size = [zip_asset.get('size', 0)]
+        # 进度回调收到的是"已下载字节数"，这里换算成比例。
+        # 分母由 size_cb 在探测到总大小时回填（atom 渠道拿不到文件大小）
+        total_size = [0]
 
         def on_progress(done):
             if total_size[0]:
                 self.root.after(0, lambda: self.set_progress(done / total_size[0]))
 
+        def on_size(total):
+            total_size[0] = total
+            log(f'更新包大小：{total} 字节（{total / 1024 / 1024:.2f} MB）')
+
         try:
-            # digest 字段（形如 "sha256:xxxxxxxx"）由 GitHub API 提供，
-            # 缺失时传 None 自动跳过校验
-            download_file(zip_asset['browser_download_url'], zip_path,
-                          on_progress, sha256=zip_asset.get('digest'))
+            download_file(zip_url, zip_path, on_progress, size_cb=on_size)
             log(f'下载完成，耗时 {_t.time() - t:.2f}s')
         except Exception as e:
             log_exc(f'下载失败：{e}')
@@ -1998,13 +2072,15 @@ class HelperApp:
 
     def auto_launch(self):
         log('准备启动主程序')
-        # 调度延时替换批处理 + 进度窗口（窗口会在替换完成后启动主程序）
-        schedule_cleanup(
+        # 先判定是否确有替换/清理任务：有则交由批处理 + 进度窗口收尾
+        # （进度窗口会在替换完成后启动主程序），无则直接启动主程序。
+        # 顺序必须是"先调度、看返回值"，不能"先调度、再查清单"——
+        # 残留清单会让后者误判为有任务。
+        scheduled = schedule_cleanup(
             delete_backup=self.update_success,
             target_exe=os.path.join(BASE_DIR, SELF_NAME),
         )
-        # 无待替换文件时，直接启动主程序
-        if not _read_manifest():
+        if not scheduled:
             launch_main()
         log('Helper 即将退出')
         self.root.destroy()
@@ -2020,7 +2096,11 @@ def main():
             total = int(sys.argv[idx + 1])
         except (IndexError, ValueError):
             total = 0
-        run_replace_window(total, MAIN_EXE)
+        try:
+            log_pos = int(sys.argv[idx + 2])
+        except (IndexError, ValueError):
+            log_pos = 0
+        run_replace_window(total, MAIN_EXE, log_pos)
         return
 
     log_env()
@@ -2032,6 +2112,9 @@ def main():
     # 拿到唯一实例资格后，清理上次运行残留的 _MEI 垃圾目录
     # （注意：*.old 文件不属于这里 —— 那由批处理【清理】阶段负责）
     cleanup_stale_mei()
+    # 兜底清理上次异常中断残留的替换状态文件与暂存目录，
+    # 避免残留清单在"已是最新版本"时误触发替换流程
+    cleanup_stale_replace_files()
 
     # 正常退出 / 异常终止时释放 Mutex，避免残留死锁
     atexit.register(_instance_lock.release)
