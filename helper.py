@@ -1817,8 +1817,28 @@ class HelperApp:
                              width=14, state='disabled')
         self.btn.pack(pady=(22, 0))
 
+        # 是否已启动主程序（防止"退出路径兜底"重复拉起第二个实例）
+        self.launched = False
+        # 是否处于不可中断的更新关键阶段（标记 *.old -> 替换 之间）
+        self._busy = False
+        # 接管窗口关闭：关键阶段不允许中途退出
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
         self.root.after(200, lambda: threading.Thread(
             target=self.check, daemon=True).start())
+
+    def _on_close(self):
+        """窗口关闭请求处理。
+
+        更新关键阶段（标记 *.old -> 替换）中途退出，会让目录停在
+        "一半新、一半 *.old"：残留的 *.old 会在下次启动被清理，
+        等于把这些文件永久丢掉。因此该阶段内忽略关闭请求。
+        """
+        if self._busy:
+            log('更新进行中，忽略窗口关闭请求', level='WARN')
+            self.set_status('更新进行中，请稍候…', '#ffb86c')
+            return
+        self.root.destroy()
 
     def set_status(self, text, color=FG):
         self.status.config(text=text, fg=color)
@@ -1853,6 +1873,7 @@ class HelperApp:
             log_exc(f'检查更新流程异常：{e}')
             self._ui(self.set_status, '更新失败，将直接启动程序', '#ffb86c')
         finally:
+            self._busy = False      # 无论从哪个分支退出，都解除"不可关闭"保护
             self._ui(self.enable_start)
 
     def _check_impl(self):
@@ -1932,6 +1953,8 @@ class HelperApp:
         # 随后内联把新文件搬到原路径，无需独立进程与"退出后批处理"。
         self._ui(self.set_status, '正在应用更新...')
         self._ui(self.set_progress, 0)
+        # 进入关键阶段：从此刻直到替换结束，忽略窗口关闭请求（见 _on_close）
+        self._busy = True
         ok, msg = apply_update(zip_path)
 
         if os.path.exists(zip_path):
@@ -1998,13 +2021,25 @@ class HelperApp:
         self.root.after(800, self.auto_launch)
 
     def auto_launch(self):
-        if self.launch_after:
+        if self.launch_after and not self.launched:
             log('准备启动主程序')
-            launch_main()
-        else:
+            self.launched = launch_main()
+        elif not self.launch_after:
             log('无需启动主程序（已在运行或已交给兜底批处理）', level='DEBUG')
         log('Helper 即将退出')
         self.root.destroy()
+
+    def ensure_launch(self):
+        """退出路径兜底：窗口被关闭或 GUI 异常时，也必须把主程序拉起来。
+
+        auto_launch 依赖 tkinter 事件循环（root.after(800)）：窗口一旦销毁，
+        事件循环结束、_ui() 也会静默跳过，就没有人再启动主程序了。
+        因此由 main() 的 finally 直接调用本方法兜底（唯一调用点）。
+        """
+        if not self.launch_after or self.launched:
+            return
+        log('界面退出路径未能启动主程序，由退出兜底启动', level='WARN')
+        self.launched = launch_main()
 
 
 def main():
@@ -2028,9 +2063,10 @@ def main():
     # 正常退出 / 异常终止时释放 Mutex，避免残留死锁
     atexit.register(_instance_lock.release)
 
+    app = None
     try:
         root = tk.Tk()
-        HelperApp(root)
+        app = HelperApp(root)
         root.mainloop()
     except Exception as e:
         log_exc(f'GUI 异常退出：{e}')
@@ -2039,6 +2075,10 @@ def main():
         _instance_lock.release()
         # 仅在内联替换失败时才会启动兜底批处理（独立 cmd 进程）
         _flush_pending_replace()
+        # 窗口被关闭 / GUI 异常时，事件循环不会再驱动 auto_launch，
+        # 这里兜底保证"用户最终一定看得到主程序"
+        if app is not None:
+            app.ensure_launch()
         log('Helper 已退出')
 
 

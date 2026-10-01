@@ -48,13 +48,13 @@
 6. cleanup_stale_replace_files()  清理残留状态文件与 _staging（批处理存在则跳过）
 7. atexit.register(release)       兜底释放锁
 8. tk.Tk() → HelperApp → mainloop 进入 GUI
-9. finally: release + _flush_pending_replace()
+9. finally: release + _flush_pending_replace() + ensure_launch()
 ```
 
 第 4–6 步必须在拿到 Mutex **之后**执行：那时不存在第二个 helper 实例，文件不再被占用。
 
 `HelperApp.__init__` 在 200ms 后拉起后台线程 `check()`；GUI 期间所有界面更新都通过
-`_ui()` 投递到主线程（见 §4.3）。
+`_ui()` 投递到主线程，并接管 `WM_DELETE_WINDOW`（见 §4.3）。
 
 ---
 
@@ -136,7 +136,14 @@ finally: 释放 Mutex
 - 所有界面更新都经 `_ui(fn, *args)` 投递，内部吞掉该异常；
 - `check()` 只做「异常兜底 + `finally` 收敛到 `enable_start()`」，
   流程本体在 `_check_impl()` 中；
-- **关键动作（启动主程序）不依赖 UI**，即使窗口被关闭也会执行。
+- **关键动作（启动主程序）不依赖 UI**，即使窗口被关闭也会执行：
+  `auto_launch()` 会置位 `launched`，而 `main()` 的 `finally` 会调用
+  `ensure_launch()` 兜底 —— 窗口被关掉、事件循环结束、`_ui()` 静默跳过时，
+  仍保证主程序被拉起（且不会重复拉起）。
+- **关键阶段不可中断**：`_check_impl()` 在调用 `apply_update()` 前把 `_busy`
+  置为 `True`，`check()` 的 `finally` 复位。`_busy` 期间 `_on_close()` 忽略
+  窗口关闭请求 —— 否则目录会停在「一半新、一半 `.old`」，而残留的 `.old`
+  会在下次启动被清理，等于永久丢掉这些文件。
 
 ---
 
@@ -205,7 +212,7 @@ tag 取最大者，不能只看第一条。
 | 目标文件被占用 | 重试 8 次 → 兜底 bat（退出后再试） | 「部分文件被占用，即将退出后完成更新...」 |
 | 兜底 bat 也无法生成 | 回滚 | 「更新失败，已回滚（N 项未替换）」 |
 | 替换清单为空 | 判定失败并回滚 | 「更新失败，已回滚」 |
-| 更新途中用户关窗 | 流程继续，主程序仍被启动 | 窗口消失后主程序照常出现 |
+| 更新途中用户关窗 | 关键阶段（备份/标记/解压/替换）忽略关闭请求；非关键阶段关闭后由 `ensure_launch()` 兜底启动主程序 | 关键阶段会看到「更新进行中，请稍候…」；其余情况主程序照常出现 |
 | 回滚后关键文件缺失 | 写 ERROR 日志（不静默） | 日志中可见 `[ERROR] 回滚后关键文件缺失` |
 
 ---
