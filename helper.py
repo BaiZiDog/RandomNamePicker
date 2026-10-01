@@ -5,13 +5,22 @@
 版本判定：从 releases.atom（公开 XML，不走 API 配额）读取最新 tag，
 与本地版本号做版本号比较（v{M}.{N} 或 v{M}.{N}.{字母补丁}）。
 
-更新策略：
+更新策略（单进程完成，不再需要独立的替换进程/进度窗口）：
   1. 版本检查：releases.atom 取最新 tag，与 LOCAL_VERSION 做版本号比较
   2. 下载 app.zip（代理兜底 + 分块多线程）
   3. 全量备份 BASE_DIR 到 _backup（仅用于失败回滚）
-  4. 待替换内容统一改名 *.old（不直接删除，规避占用），新包解压到 _staging
-  5. 任一步失败 -> 用 _backup 回滚；成功 -> helper 退出后由 _replace.bat
-     分批替换文件、清理残留并删除 _backup
+  4. 把待替换项统一改名 *.old 以腾出原路径 —— Windows 允许重命名运行中的
+     可执行文件/动态库，因此这一步连 helper.exe 自身也能在运行中完成；
+     新包解压到 _staging
+  5. 内联把 _staging 的新文件搬到原路径（replace_staged，带重试）：
+       成功 -> 删除 _backup，随后由 Helper 启动主程序
+       失败 -> 交给退出后的 _replace.bat 兜底：它会再试一次，必要时从
+               _backup 回滚，最后启动主程序
+  6. 残留的 *.old 由下次启动 helper 时清理（cleanup_stale_old_files）——
+     那时旧进程已退出、文件不再被占用，删除必然成功
+  7. 硬约束（失败路径必须收敛）：任何失败分支都要落到"回滚"或"明确的失败态"，
+     绝不允许带着"一半新、一半 *.old"的状态启动主程序；回滚结束时自检
+     helper.exe 与主程序是否仍在位，把静默损坏转成日志里可见的 ERROR
 """
 import os
 import sys
@@ -44,10 +53,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(
 MAIN_EXE = os.path.join(BASE_DIR, 'RandomNamePicker.exe')
 
 # 当前版本号（硬编码，每次发版时同步更新）
-LOCAL_VERSION = 'v2.0'
+LOCAL_VERSION = 'v1.5.a'
 
-# 更新时保留在根目录的内容（不会被删除、不会被覆盖）
-KEEP_ITEMS = {'helper.exe', 'data'}
+# 更新时【原样保留】的内容（不改名、不删除、不覆盖）。
+# 注意：helper.exe 不在此列 —— 它需要在运行中被改名成 *.old 以腾出文件名
+# （Windows 允许重命名运行中的可执行文件，镜像仍由已映射的句柄持有），
+# 新版本随后直接落位到原路径，无需等待进程退出。
+KEEP_ITEMS = {'data'}
 
 # 备份目录名（仅失败回滚用，更新成功后由批处理删除）
 BACKUP_DIR_NAME = '_backup'
@@ -94,44 +106,36 @@ MIN_SPEED = 30 * 1024
 # 延时批处理替换配置
 # ---------------------------------------------------------------------------
 
-# 延时替换清单文件名（记录哪些文件需要退出后替换）
+# 替换清单文件名：safe_extract() 写 -> check() 读 -> 读后立即删
 REPLACE_MANIFEST = '_replace_manifest.txt'
+# 已标记 *.old 的文件清单：clean_dir() 写 -> 下次启动 cleanup_stale_old_files() 读并删。
+# 内容为磁盘上的完整名称（含 .old 后缀）。用于【精确清理】：
+# 只删除本清单列出的 *.old，绝不碰用户自己放在程序目录的 .old 文件。
+MARKED_MANIFEST = '_marked_manifest.txt'
 # 被占用文件的临时后缀（“标记”阶段统一改名为此后缀，“清理”阶段据此识别删除）
 OLD_SUFFIX = '.old'
 # 延时替换报告文件名
 REPLACE_REPORT = '_replace_report.txt'
+# 兜底批处理日志文件名：批处理以 GBK（chcp 936）输出，单独成文件，
+# 避免与 Python 侧 UTF-8 的 helper.log 追加到同一文件形成混合编码
+REPLACE_BATCH_LOG = 'helper_batch.log'
 # 延时替换批处理文件名
 REPLACE_BAT = '_replace.bat'
 # 批处理实际存放目录（放在 BASE_DIR 之外，避免回滚时的 for 循环把它自己删掉）
 REPLACE_BAT_DIR = os.path.join(tempfile.gettempdir(), 'RandomNamePickerReplace')
-# 新版本暂存目录（解压到这里，退出后由批处理搬到目标位置）
+# 新版本暂存目录（解压到这里，随后由 replace_staged 搬到目标位置）
 STAGING_DIR = '_staging'
 
-# 每批处理的文件数（批次大小）
+# 每批处理的文件数（批次大小）—— 仅用于兜底批处理
 REPLACE_BATCH_SIZE = 32
 # 批次之间的间隔秒数（给系统释放句柄留时间）
 REPLACE_BATCH_INTERVAL = 0
-# 单个文件替换的最大重试次数
+# 单个文件替换的最大重试次数（内联替换与兜底批处理共用）
 REPLACE_MAX_RETRY = 8
 # 单次重试的等待秒数
 REPLACE_RETRY_WAIT = 1
-# 批处理（独立 cmd 进程）由 main() 的退出路径启动，此时 Helper 已在退出中，
-# 因此首段只需要等进度窗口就绪（见下），不再固定 sleep。
+# 兜底批处理由 main() 的退出路径启动，先等 Helper 完全退出再开始搬运
 REPLACE_INITIAL_WAIT = 1
-# 进度窗口就绪标志文件（窗口进程启动后写入，批处理首段轮询等待它出现，
-# 取代固定时间缓冲 —— 慢速磁盘/杀软扫描时依旧可靠）
-REPLACE_WINDOW_READY_FLAG = '_replace_window_ready.flag'
-# 批处理等待窗口就绪标志的轮数上限（每轮约 1s，超时则强制开始）
-REPLACE_WINDOW_WAIT = 30
-
-# “标记-清理”两阶段中【清理】阶段的删除尝试参数。
-# 被进度窗口（第二个 helper.exe 实例）短暂映射的文件可能删除失败，
-# 失败即残留，下次更新时的清理段会再次扫描重试。
-OLD_DEL_RETRY = 3
-# 单次重试的等待秒数
-OLD_DEL_WAIT = 1
-# 清理段开始前等待进度窗口退出的秒数（窗口完成替换后会自行退出）
-OLD_CLEAN_WAIT = 5
 
 # 自身 _MEI 残留目录标记文件 + 清理年龄门槛（秒）
 # PyInstaller onefile 退出时若临时目录被占用（杀软扫描、子进程句柄等），
@@ -140,30 +144,41 @@ OLD_CLEAN_WAIT = 5
 MEI_MARKER = '._randomnamepicker_mei'
 MEI_CLEAN_MIN_AGE = 300
 
-# 替换进度窗口配置
-REPLACE_WIN_TITLE = '随机点名工具 - 正在更新'
-REPLACE_WIN_W = 460
-REPLACE_WIN_H = 300
-# 进度窗口轮询日志的间隔（毫秒）
-REPLACE_WIN_POLL_MS = 200
-# 替换完成后自动启动主程序的延迟（毫秒）
-REPLACE_WIN_LAUNCH_DELAY_MS = 100
-
-# 回滚标记文件名（批处理回滚时写入，进度窗口据此识别结局）
+# 回滚标记文件名（兜底批处理回滚时写入，便于排查与下次启动时清理）
 REPLACE_ROLLBACK_FLAG = '_replace_rollback.flag'
+
+# ---------------------------------------------------------------------------
+# 跨阶段状态文件契约（谁写、谁读、谁删、何时删）—— 集中记录，避免散落各处漏删
+# ---------------------------------------------------------------------------
+#   _replace_manifest.txt   写：safe_extract() | 读：check()            | 删：check() 读后立即删
+#   _marked_manifest.txt    写：clean_dir()    | 读：cleanup_stale_old_*  | 删：cleanup 用后即删
+#   _replace_rollback.flag  写：兜底批处理      | 读：仅人工排查          | 删：下次启动 cleanup_stale_replace_files()
+#   _replace_report.txt     写：兜底批处理      | 读：仅人工排查          | 删：不删（保留证据）
+#   _staging/               写：safe_extract() | 读：replace_staged()    | 删：成功/回滚/兜底/下次启动 cleanup
+#   以上任一文件"漏删"都可能让下次启动误判流程状态，因此全部集中在
+#   cleanup_stale_replace_files() 与 rollback() 两处收口。
+
+# 回滚清空阶段的【额外】保留项（KEEP_ITEMS 之外）。
+# 备份目录本身、日志、更新包与替换报告都要留下：备份用于手动还原，其余用于排查。
+ROLLBACK_KEEP = {
+    BACKUP_DIR_NAME, 'helper.log', 'app.log', 'app.zip',
+    REPLACE_REPORT, REPLACE_BATCH_LOG, REPLACE_ROLLBACK_FLAG,
+}
 
 # 替换规则：按顺序匹配，第一条命中的规则决定该文件的处理方式
 #   pattern : 正则表达式（匹配相对路径，大小写不敏感）
-#   mode    : 'replace' 延时替换 / 'skip' 跳过不处理 / 'delete' 删除
+#   mode    : 'replace' 纳入替换清单 / 'skip' 跳过不处理 / 'delete' 删除
 #   desc    : 规则说明（写入日志）
+# 说明：'replace' 现在指"由 replace_staged() 内联替换" —— 标记阶段已把原文件
+# 改名 *.old 腾出路径，因此运行中的 exe/dll 也能直接落位，不再需要"退出后替换"。
 REPLACE_RULES = [
-    # 自身可执行文件：必须延时替换（运行中无法覆盖）
+    # 自身可执行文件：纳入替换清单（原路径已腾空，可运行中落位）
     {'pattern': r'^helper\.exe$', 'mode': 'replace',
-     'desc': 'Helper 自身，退出后替换'},
-    # 主程序：退出后替换
+     'desc': 'Helper 自身，内联替换'},
+    # 主程序：内联替换
     {'pattern': r'^RandomNamePicker\.exe$', 'mode': 'replace',
-     'desc': '主程序，退出后替换'},
-    # 动态库：最容易被进程锁定，必须延时替换
+     'desc': '主程序，内联替换'},
+    # 动态库：最容易被进程锁定，替换失败会重试并交兜底批处理
     {'pattern': r'\.(dll|pyd|so|dylib)$', 'mode': 'replace',
      'desc': '动态库，易被占用'},
     # 用户数据：绝不覆盖
@@ -172,8 +187,7 @@ REPLACE_RULES = [
     # 日志与备份：不处理
     {'pattern': r'^(helper\.log|app\.log|_backup([\\/].*)?)$', 'mode': 'skip',
      'desc': '日志/备份，保留'},
-    # 临时文件：清理掉
-    # 注意：用 re.match 时模式从字符串开头匹配，故需 .* 前缀
+    # 临时文件：清理掉（match_replace_rule 用 re.search，无需 .* 前缀）
     {'pattern': r'.*\.(tmp|temp|bak|old)$', 'mode': 'delete',
      'desc': '临时文件，删除'},
     # 其余文件：默认延时替换
@@ -194,8 +208,9 @@ def log(msg, level='INFO'):
     格式：[时间] [级别] [线程] 消息
     level: INFO / WARN / ERROR / DEBUG
 
-    日志统一以 UTF-8 写入 helper.log。批处理侧用 chcp 936 追加，
-    读取时由 read_log_lines() 逐行兼容两种编码。
+    本函数统一以 UTF-8 写入 helper.log；兜底批处理侧以 GBK 写入
+    helper_batch.log（REPLACE_BATCH_LOG），两个文件各自保持单一编码，
+    排查时不必再做分段解码。
     """
     try:
         import time as _t
@@ -213,75 +228,6 @@ def log_exc(msg):
     """记录异常及其完整堆栈，便于定位问题。"""
     import traceback
     log(f'{msg}\n{traceback.format_exc()}', level='ERROR')
-
-
-def read_log_lines(path, start=0):
-    """读取 helper.log，返回 (行列表, 新位置)。
-
-    helper.log 是混合编码：Python 侧写 UTF-8，批处理侧写 GBK。
-    这里逐行尝试 UTF-8，失败则回退 GBK，保证两边都能正确显示。
-    """
-    lines = []
-    if not os.path.exists(path):
-        return lines, start
-    try:
-        with open(path, 'rb') as f:
-            f.seek(start)
-            data = f.read()
-            new_pos = f.tell()
-    except OSError:
-        return lines, start
-
-    for raw in data.split(b'\n'):
-        if not raw.strip():
-            continue
-        try:
-            text = raw.decode('utf-8')
-        except UnicodeDecodeError:
-            text = raw.decode('gbk', errors='replace')
-        lines.append(text.rstrip('\r'))
-    return lines, new_pos
-
-
-def _log_size(path):
-    """返回日志文件当前字节大小（进度窗口的起读偏移）。
-
-    进度窗口只应统计"本次"替换结果：helper.log 跨会话保留，
-    历史 [OK]/[FAIL] 行若被计入会让窗口虚增完成数、提前收尾。
-    父进程在启动批处理前捕获偏移并传给窗口，保证只读本批次新增行。
-    """
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
-
-
-def classify_replace_log_line(line):
-    """把替换日志行归类，供进度窗口统计与展示。
-
-    返回 'ok' / 'fail' / 'skip' / 'mark' / 'end' / 'rollback' / 'batch' /
-    ''（无关行）。仅 [OK]/[FAIL] 计入进度；[MARK]（helper.exe 标记行）
-    不计数 —— 该行旧版用 [OK] 前缀，导致幽灵 +1、窗口提前收尾。
-
-    匹配锚定在日志的"级别字段"上（`] [OK]` 形式），而不是裸子串：
-    文件相对路径或规则描述里若含 "[OK]" 字样，裸子串匹配会把一条
-    [FAIL] 行误判为 ok，导致计数错乱、窗口提前收尾。
-    """
-    if '] [OK]' in line:
-        return 'ok'
-    if '] [FAIL]' in line:
-        return 'fail'
-    if '] [SKIP]' in line:
-        return 'skip'
-    if '] [MARK]' in line:
-        return 'mark'
-    if '延时替换结束' in line:
-        return 'end'
-    if '回滚' in line:
-        return 'rollback'
-    if '批次' in line and '---' in line:
-        return 'batch'
-    return ''
 
 
 def _mark_mei():
@@ -311,9 +257,8 @@ def cleanup_stale_mei():
     三重保护，避免误删：
       1) 只清理目录中含本程序标记文件 MEI_MARKER 的；
       2) 跳过创建不超过 MEI_CLEAN_MIN_AGE 秒的目录（可能仍在运行中）；
-      3) 必须在获取到单实例 Mutex 之后再调用 —— 同一时刻只有唯一一个
-         实例会执行清理，正常启动的辅助进程（进度窗口）生命周期极短，
-         且会被年龄门槛挡住。
+      3) 必须在获取到单实例 Mutex 之后再调用 —— 同一时刻只有唯一一个实例
+         会执行清理，不会出现两个实例互相删除对方临时目录的情况。
     """
     tmp = tempfile.gettempdir()
     own = os.path.abspath(getattr(sys, '_MEIPASS', '') or '')
@@ -351,27 +296,25 @@ def cleanup_stale_replace_files():
     误判为有替换任务 —— 即使本次"已是最新版本"，也会跑延时替换批处理，
     把 helper.exe 改名 .old 后当垃圾清掉，且无 _backup 可回滚。
 
-    安全前提：只有"批处理与 _staging 同时存在"才跳过 —— 那才可能是进行中的
-    替换（批处理会把 _staging 里的文件搬到目标位置，此时删 _staging 会让
-    替换因"暂存缺失"失败并触发回滚）。
-    批处理正常结束会自删，且删除 _staging 后还要跑清理段；因此
-    "批处理在但 _staging 不在"说明替换已过搬运阶段或根本没跑起来，
-    残留的状态文件可以安全清理，不会出现"一个残留 bat 永久挡住兜底"。
+    安全前提：只要兜底批处理存在就跳过 —— 它可能正在搬运文件
+    （此时删 _staging 会让替换因"暂存缺失"失败并触发回滚）。
+    批处理正常结束会自删，故"下次启动时它已不存在"是常态；
+    若它因异常残留，也只会让本次残留清理跳过一轮，不会造成损坏。
+    批处理在但 _staging 不在的那些瞬间（搬运中会清空 _staging），
+    同样按"仍在进行"处理，避免误删。
 
     跨进程/跨阶段的状态文件必须明确"谁写、谁读、谁删、何时删"：
-      写：safe_extract()  →  读：schedule_cleanup()  →  删：生成 bat 后立即删
+      写：safe_extract()  →  读：check()（内联替换前）  →  删：读取后立即删
       本函数是"异常中断导致漏删"时的兜底。
     """
     bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
-    staging = os.path.join(BASE_DIR, STAGING_DIR)
-    if os.path.exists(bat_path) and os.path.isdir(staging):
-        log('疑似替换仍在进行（批处理与暂存目录同时存在），跳过残留清理', level='WARN')
+    if os.path.exists(bat_path):
+        log('疑似兜底替换仍在进行（批处理存在），跳过残留清理', level='WARN')
         return
 
     for path, desc in (
         (os.path.join(BASE_DIR, REPLACE_MANIFEST), '替换清单'),
         (os.path.join(BASE_DIR, REPLACE_ROLLBACK_FLAG), '回滚标志'),
-        (os.path.join(REPLACE_BAT_DIR, REPLACE_WINDOW_READY_FLAG), '窗口就绪标志'),
     ):
         try:
             if os.path.exists(path):
@@ -381,6 +324,7 @@ def cleanup_stale_replace_files():
             log(f'清理残留{desc}失败：{e}', level='WARN')
 
     try:
+        staging = os.path.join(BASE_DIR, STAGING_DIR)
         if os.path.isdir(staging):
             shutil.rmtree(staging, ignore_errors=True)
             log(f'已清理残留暂存目录：{staging}', level='WARN')
@@ -388,9 +332,70 @@ def cleanup_stale_replace_files():
         log(f'清理残留暂存目录失败：{e}', level='WARN')
 
 
-# 注意：helper.py 不再负责删除 *.old 文件 —— 那属于【清理】阶段，
-# 由批处理脚本统一扫描删除，与 helper 的【标记】阶段完全分离。
-# 见 _gen_replace_batch() 中的"清理 .old 残留"段。
+# 注意：helper.py 的【标记】阶段只把待替换/待清理项改名 *.old，不删除；
+# 删除由下次启动时的 cleanup_stale_old_files() 完成（见该函数说明）。
+# 之所以不在退出后的批处理里删：进程退出时机不可控（系统可能仍持有映像句柄），
+# helper.exe.old / VCRUNTIME140*.dll.old 常因仍被占用而删除失败。
+
+
+def cleanup_stale_old_files():
+    """清理上次更新残留的 *.old 文件（【清理】阶段）。
+
+    背景：更新时 clean_dir() 把待替换/待清理项统一改名 *.old（规避占用），
+    真正的删除推迟到"下次启动 helper"时执行 —— 那时旧进程早已退出，
+    文件不再被占用，删除必然成功。残留的 helper.exe.old 会让下次更新的
+    标记逻辑"放弃标记"，导致新 helper.exe 无法就位、更新静默失败。
+
+    为什么不在退出后的批处理里删：批处理只能固定等待若干秒，而进程退出
+    时机不可控，helper.exe.old / VCRUNTIME140*.dll.old 常因仍被占用而失败。
+
+    清理范围【只限 MARKED_MANIFEST 记录的条目】（由 clean_dir 写入）：
+    用户自己放在程序目录里的 .old 文件因此不会被误删；若清单不存在
+    （本次没更新过，或回滚已把 .old 清空），本函数不做任何删除。
+
+    时机：必须在获取单实例 Mutex 之后调用 —— 此时无其他 helper 实例。
+    _backup 目录内的 *.old 是回滚依据，绝不触碰。
+    """
+    manifest_path = os.path.join(BASE_DIR, MARKED_MANIFEST)
+    if not os.path.exists(manifest_path):
+        log('无待清理清单，跳过 .old 清理', level='DEBUG')
+        return
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            names = [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        log(f'读取待清理清单失败：{e}，跳过 .old 清理', level='WARN')
+        return
+
+    remaining = []
+    for name in names:
+        # 双保险：只处理带 .old 后缀的顶层项
+        if not name.endswith(OLD_SUFFIX):
+            continue
+        path = os.path.join(BASE_DIR, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            log(f'已清理残留：{name}', level='WARN')
+        except OSError as e:
+            remaining.append(name)
+            log(f'清理残留 {name} 失败（下次再试）：{e}', level='WARN')
+
+    # 全部成功才删除清单；仍有残留则回写剩余项，下次启动继续尝试
+    try:
+        if remaining:
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                for name in remaining:
+                    f.write(f'{name}\n')
+        else:
+            os.remove(manifest_path)
+            log(f'已删除待清理清单：{manifest_path}', level='DEBUG')
+    except OSError as e:
+        log(f'更新待清理清单失败：{e}', level='WARN')
 
 
 # ---------------------------------------------------------------------------
@@ -536,14 +541,31 @@ def _asset_url(tag, name):
     return f'https://github.com/{GITHUB_REPO}/releases/download/{tag}/{name}'
 
 
+def _parse_atom_tags(xml_bytes):
+    """从 releases.atom 的 XML 中提取所有 entry 的 title（即 tag 列表）。
+
+    用命名空间无关的后缀匹配（endswith），避免 GitHub 改命名空间前缀时失效。
+    """
+    root = ET.fromstring(xml_bytes)
+    tags = []
+    for entry in root.iter():
+        if not entry.tag.endswith('entry'):
+            continue
+        for child in entry:
+            if child.tag.endswith('title'):
+                tag = (child.text or '').strip()
+                if tag:
+                    tags.append(tag)
+                break
+    return tags
+
+
 def get_latest_tag():
     """从 releases.atom 获取最新 tag（取版本号最大者）。
 
     为什么不用 API：未认证的 GitHub API 按 IP 限速 60 次/小时，
     反复调试或用户多次启动就会耗尽，之后所有请求返回 403，
     更新流程直接瘫痪。releases.atom 是公开 XML，无速率限制、无需 Token。
-
-    解析用命名空间无关的 tag 后缀匹配，避免 GitHub 改命名空间前缀时失效。
 
     为什么不是"取第一条"：atom 条目按【创建/更新时间】倒序，而不是按版本。
     实测把 v1.5-fix 重命名为 v1.5.a 后，旧版本立刻排到了第一条。
@@ -557,34 +579,25 @@ def get_latest_tag():
         try:
             log(f'获取最新版本（{name}）：{src}', level='DEBUG')
             with _open_url(src, timeout=ATOM_TIMEOUT) as resp:
-                xml_bytes = resp.read()
-            root = ET.fromstring(xml_bytes)
-
-            tags = []
-            for entry in root.iter():
-                if not entry.tag.endswith('entry'):
-                    continue
-                for child in entry:
-                    if child.tag.endswith('title'):
-                        tag = (child.text or '').strip()
-                        if tag:
-                            tags.append(tag)
-                        break
-
-            if not tags:
-                log(f'atom 中没有 entry（来源={name}）', level='WARN')
-                continue
-
-            candidates = [(p, t) for t in tags for p in [_parse_version(t)] if p]
-            if not candidates:
-                log(f'atom 中的 tag 均不符合命名规则：{tags}', level='WARN')
-                continue
-            latest = max(candidates)[1]
-            log(f'atom 共 {len(tags)} 个 tag，版本号最大者为 {latest}'
-                f'（来源={name}）', level='DEBUG')
-            return latest
+                tags = _parse_atom_tags(resp.read())
         except Exception as e:
             log(f'获取最新 tag 失败（来源={name}）：{e}', level='WARN')
+            continue
+
+        if not tags:
+            log(f'atom 中没有 entry（来源={name}）', level='WARN')
+            continue
+
+        candidates = [(p, t) for t in tags for p in [_parse_version(t)] if p]
+        if not candidates:
+            log(f'atom 中的 tag 均不符合命名规则：{tags}', level='WARN')
+            continue
+
+        latest = max(candidates)[1]
+        log(f'atom 共 {len(tags)} 个 tag，版本号最大者为 {latest}'
+            f'（来源={name}）', level='DEBUG')
+        return latest
+
     log('所有来源均无法获取最新 tag', level='ERROR')
     return None
 
@@ -995,16 +1008,18 @@ def backup_current(backup_root, exclude=None):
 
 
 def clean_dir(keep=None):
-    """【标记】阶段：把 BASE_DIR 下待删除的项统一改名为 *.old，不直接删除。
+    """【标记】阶段：把 BASE_DIR 下待替换/待清理的项统一改名为 *.old，不直接删除。
 
     keep: 额外保留的文件/目录名集合（如正在使用的更新包 app.zip）。
 
-    “标记-清理”两阶段设计：
-      - 标记（本函数）：只改名加 .old 后缀，绝不删除。
-        被占用（WinError 5/32/33）的文件一般也能改名成功，
-        因此本阶段几乎总是全部成功，剩下的事交给批处理。
-      - 清理：退出后由 _replace.bat 扫描删除所有 *.old，
-        helper.py 不参与删除，职责完全分离。
+    "标记-清理"两阶段设计：
+      - 标记（本函数）：只改名加 .old 后缀，绝不删除。被占用（WinError 5/32/33）
+        的文件一般也能改名成功，因此本阶段几乎总是全部成功；改名后原路径即空出，
+        新文件可直接落位（Windows 允许重命名运行中的可执行文件/动态库）。
+      - 清理：推迟到【下次启动 helper】由 cleanup_stale_old_files() 执行 ——
+        那时旧进程早已退出、文件不再被占用，删除必然成功。
+        本函数把已标记项写入 MARKED_MANIFEST，清理阶段只删清单内的条目，
+        不会误删用户自己放在程序目录里的 .old 文件。
 
     返回 (marked, kept)：
       marked - 已改名标记为 .old 的项列表
@@ -1015,7 +1030,7 @@ def clean_dir(keep=None):
     kept = []
     failed = []
     for item in os.listdir(BASE_DIR):
-        if item.lower() in KEEP_ITEMS:      # 大小写不敏感匹配（helper.exe、data）
+        if item.lower() in KEEP_ITEMS:      # 大小写不敏感匹配（data）
             kept.append(item)
             continue
         if item in (BACKUP_DIR_NAME, 'helper.log') or item in keep:
@@ -1046,6 +1061,19 @@ def clean_dir(keep=None):
     if kept:
         log(f'  保留：{kept}', level='DEBUG')
 
+    # 记录本次标记的项（磁盘上的 *.old 名称），供下次启动【精确清理】。
+    # 必须写改名后的全名：清理端按 ".old" 后缀过滤，写原名会被整体跳过。
+    try:
+        with open(os.path.join(BASE_DIR, MARKED_MANIFEST), 'w',
+                  encoding='utf-8') as f:
+            for name in marked:
+                f.write(f'{name}{OLD_SUFFIX}\n')
+        log(f'已记录待清理清单：{MARKED_MANIFEST}（{len(marked)} 项）',
+            level='DEBUG')
+    except OSError as e:
+        log(f'写入待清理清单失败：{e}（这些 .old 将由下次标记时顺带删除）',
+            level='WARN')
+
     return marked, kept
 
 
@@ -1053,14 +1081,15 @@ def safe_extract(zip_path, target_dir):
     """安全解压，防 Zip Slip。
 
     所有文件先解压到暂存目录 _staging，再按替换规则分类：
-      - replace：写入延时替换清单，退出后由批处理替换
+      - replace：写入替换清单，由 replace_staged() 内联搬到目标路径
       - skip   ：不处理（用户数据等）
       - delete ：直接删除暂存文件
 
-    这样即使目标文件被占用，也不影响解压本身，替换交给退出后的批处理。
+    这样即使目标文件被占用，也不影响解压本身（替换阶段带重试，失败再交兜底批处理）。
 
     返回 (替换清单, 跳过清单, 删除清单)，均为 [(相对路径, 规则说明)]。
-    解压失败的文件不计入任何清单，但会写入日志；调用方需据此判定失败。
+    解压失败或清单写入失败都会抛异常 —— 调用方（apply_update）据此回滚，
+    绝不能"假装成功"，否则原文件已被改成 *.old，安装目录会被清空。
     """
     abs_target = _abs(target_dir)
     staging = os.path.join(BASE_DIR, STAGING_DIR)
@@ -1068,8 +1097,14 @@ def safe_extract(zip_path, target_dir):
     os.makedirs(staging, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, 'r') as zf:
+        # 完整性校验：对全部条目做 CRC 校验，可发现"下载被截断/内容损坏"的包。
+        # （比 SHA256 轻量，且不依赖外部摘要，避免引入无数据源的空校验。）
+        bad = zf.testzip()
+        if bad is not None:
+            raise Exception(f'更新包损坏（CRC 校验失败）：{bad}')
         members = zf.namelist()
-        log(f'开始解压 {len(members)} 个条目到暂存目录', level='DEBUG')
+        log(f'开始解压 {len(members)} 个条目到暂存目录（CRC 校验通过）',
+            level='DEBUG')
 
         # 防 Zip Slip
         for member in members:
@@ -1110,7 +1145,9 @@ def safe_extract(zip_path, target_dir):
         except OSError as e:
             log(f'  删除暂存文件 {rel} 失败：{e}', level='WARN')
 
-    # 写入替换清单（供退出后的批处理读取）
+    # 写入替换清单（供 check() 的内联替换阶段读取）
+    # 写失败必须上抛：此时原文件已被改成 *.old，若继续按"更新成功"处理，
+    # 调用方会删掉 _backup 与 _staging，安装目录将被清空且无法回滚。
     manifest_path = os.path.join(BASE_DIR, REPLACE_MANIFEST)
     try:
         with open(manifest_path, 'w', encoding='utf-8') as f:
@@ -1119,14 +1156,16 @@ def safe_extract(zip_path, target_dir):
         log(f'已写入替换清单：{manifest_path}（{len(to_replace)} 项）')
     except OSError as e:
         log_exc(f'写入替换清单失败：{e}')
+        raise Exception(f'写入替换清单失败：{e}')
 
     return to_replace, to_skip, to_delete
 
 
 def rollback(backup_path):
-    """从备份回滚：清空（跳过 _backup 和正在运行的自己）后还原。
+    """从备份回滚：先清空（保留白名单项）再从 _backup 还原。
 
-    被占用的文件跳过并记录，不中止。
+    被占用的文件跳过并记录，不中止；结束时做一次"关键文件不变量自检"，
+    把静默损坏转成日志里显式可见的 ERROR。
     """
     log(f'开始回滚，来源：{backup_path}', level='WARN')
     if not os.path.isdir(backup_path):
@@ -1134,17 +1173,16 @@ def rollback(backup_path):
         return
 
     # 1. 清空（尽力而为）
+    # 保留项 = KEEP_ITEMS（用户数据 data）∪ ROLLBACK_KEEP（备份/日志/更新包/报告）。
+    # 用显式白名单而不是"只保护 data"，让"删什么、留什么"一目了然。
     cleared = 0
     for item in os.listdir(BASE_DIR):
-        if item == BACKUP_DIR_NAME:
-            continue
-        # 与 KEEP_ITEMS 语义一致：data（用户名单）与 helper.exe 绝不删除。
-        # 若备份阶段 data 被占用跳过，清空后无法还原 -> 用户数据永久丢失。
-        if item.lower() in KEEP_ITEMS:
+        if item.lower() in KEEP_ITEMS or item in ROLLBACK_KEEP:
             log(f'  跳过保留项：{item}', level='DEBUG')
             continue
         path = os.path.join(BASE_DIR, item)
         if _is_running_self(path):
+            # 仅当标记阶段没能腾出自身路径时才走到这里（那时它仍是运行中的镜像）
             log(f'  跳过正在运行的自己：{item}', level='DEBUG')
             continue
         try:
@@ -1158,14 +1196,16 @@ def rollback(backup_path):
     log(f'  回滚清空完成：{cleared} 项', level='DEBUG')
 
     # 2. 还原（尽力而为）
+    # 注意：这里【不能】再用 _is_running_self(dst) 跳过 ——
+    # 标记阶段（clean_dir）已把 BASE_DIR 下的 helper.exe 改名成 helper.exe.old，
+    # 目标路径此刻是空的，写入完全合法（运行中的镜像由已映射句柄持有，与路径无关）。
+    # 旧实现把该目标当成"正在运行的自己"跳过，而唯一被跳过的恰好就是 helper.exe，
+    # 于是回滚后更新器永久消失，用户再也打不开更新入口。
     restored = 0
-    failed = 0
+    failed = []
     for item in os.listdir(backup_path):
         src = os.path.join(backup_path, item)
         dst = os.path.join(BASE_DIR, item)
-        if _is_running_self(dst):
-            log(f'  跳过正在运行的自己：{item}', level='DEBUG')
-            continue
         try:
             if os.path.isdir(src) and not os.path.islink(src):
                 # dirs_exist_ok=True：目标可能已存在（清空时被占用的没删掉）
@@ -1174,11 +1214,18 @@ def rollback(backup_path):
                 shutil.copy2(src, dst, follow_symlinks=False)
             restored += 1
         except OSError as e:
-            failed += 1
+            failed.append(item)
             log(f'回滚还原 {item} 失败（跳过）：{e}', level='WARN')
 
+    # 3. 不变量自检：回滚后必须仍有"更新器 + 主程序"，否则用户会失去入口
+    missing = [name for name in (SELF_NAME, os.path.basename(MAIN_EXE))
+               if not os.path.exists(os.path.join(BASE_DIR, name))]
+    if missing:
+        log(f'[ERROR] 回滚后关键文件缺失：{missing}；'
+            f'备份仍保留在 {backup_path}，可手动还原', level='ERROR')
     if failed:
-        log(f'回滚完成：还原 {restored} 项，失败 {failed} 项', level='WARN')
+        log(f'回滚完成：还原 {restored} 项，失败 {len(failed)} 项：{failed}',
+            level='WARN')
     else:
         log(f'回滚完成：还原 {restored} 项')
 
@@ -1236,8 +1283,57 @@ def apply_update(zip_path):
         return False, '解压失败，已回滚'
 
     log(f'===== 更新应用成功，总耗时 {_t.time() - t0:.2f}s =====')
-    log(f'待替换文件将在 Helper 退出后由批处理分批完成')
-    return True, f'成功（{len(to_replace)} 项待退出后替换）'
+    log(f'待替换 {len(to_replace)} 项，由 Helper 内联完成')
+    return True, f'成功（{len(to_replace)} 项待替换）'
+
+
+def replace_staged(items, progress_cb=None, retries=REPLACE_MAX_RETRY):
+    """把 _staging 里的新文件搬到目标路径（Helper 内联完成的"替换"阶段）。
+
+    前提：clean_dir() 已把目标位置的原文件统一改名 *.old，原路径已空出，
+    因此无需等待任何进程退出即可直接落位 —— Windows 允许重命名运行中的
+    可执行文件/动态库（镜像由已映射的句柄持有，与路径无关）。
+
+    items:       [(相对路径, 规则说明)]
+    progress_cb: fn(done, total, rel)，每项开始时回调一次，供 GUI 显示进度
+    retries:     单个文件的最大重试次数
+
+    返回 (ok, failed)：failed 为 [(相对路径, 失败原因)]；ok 为 True 表示全部成功。
+    """
+    staging = os.path.join(BASE_DIR, STAGING_DIR)
+    total = len(items)
+    failed = []
+    for idx, (rel, _desc) in enumerate(items, 1):
+        if progress_cb:
+            try:
+                progress_cb(idx, total, rel)
+            except Exception:
+                pass
+        src = os.path.join(staging, rel)
+        dst = os.path.join(BASE_DIR, rel)
+        last_err = ''
+        for attempt in range(1, retries + 1):
+            try:
+                parent = os.path.dirname(dst)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                if os.path.exists(dst):
+                    os.remove(dst)          # 目标应已空出；有残留则先清掉
+                shutil.move(src, dst)
+                last_err = ''
+                break
+            except OSError as e:
+                last_err = str(e)
+                if attempt < retries:
+                    time.sleep(REPLACE_RETRY_WAIT)
+        if last_err:
+            failed.append((rel, last_err))
+            log(f'[FAIL] {rel} 替换失败（已重试 {retries} 次）：{last_err}',
+                level='WARN')
+        else:
+            log(f'[OK] {rel}', level='DEBUG')
+    log(f'内联替换完成：成功 {total - len(failed)} 项，失败 {len(failed)} 项')
+    return (not failed), failed
 
 
 # ---------------------------------------------------------------------------
@@ -1286,7 +1382,7 @@ def _bat_escape(s):
             .replace('|', '^|').replace('<', '^<').replace('>', '^>')
 
 
-def _gen_replace_batch(items, delete_backup, backup_root):
+def _gen_replace_batch(items, delete_backup, backup_root, launch_main=False):
     """生成分批替换批处理脚本。
 
     设计要点：
@@ -1301,14 +1397,14 @@ def _gen_replace_batch(items, delete_backup, backup_root):
     # 归一化相对路径分隔符（防御：无论源头是 / 还是 \\，生成的都是 \\ 路径）
     items = [(rel.replace('/', '\\'), desc) for rel, desc in items]
     staging = os.path.join(BASE_DIR, STAGING_DIR)
-    # 日志统一写入 helper.log（追加模式，与 Python 侧日志合并）
-    log_path = os.path.join(BASE_DIR, 'helper.log')
+    # 批处理以 chcp 936（GBK）输出，单独写一个日志文件：
+    # 与 Python 侧 UTF-8 的 helper.log 混写会形成混合编码，排查时需分段解码。
+    log_path = os.path.join(BASE_DIR, REPLACE_BATCH_LOG)
     report_path = os.path.join(BASE_DIR, REPLACE_REPORT)
 
     L = [
         '@echo off',
         # 批处理以 GBK 写入，日志也用 GBK 输出（实测 chcp 65001 会让 echo 中文变乱码）。
-        # Python 侧读取时按 GBK 解码，见 _read_log_lines()。
         'chcp 936 >nul',
         'setlocal enabledelayedexpansion',
         f'set "BASE={_bat_escape(BASE_DIR)}"',
@@ -1319,83 +1415,25 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         'set /a FAIL=0',
         'set /a BATCHNO=0',
         '',
-        # 追加写入（>>），与 Python 侧日志合并到同一文件
+        # 追加写入（>>）到批处理专用日志（GBK 编码，与 helper.log 分开）
         'echo [%date% %time%] ===== 延时替换开始 ===== >> "%LOG%"',
         f'echo 批次大小={REPLACE_BATCH_SIZE} 批间隔={REPLACE_BATCH_INTERVAL}s '
         f'重试={REPLACE_MAX_RETRY} >> "%LOG%"',
         '',
-        # ---- 替换前：等待进度窗口就绪标志 ----
-        # 批处理以独立 cmd 进程运行，由 main() 的退出路径（finally）启动。
-        # 进度窗口（另一个 helper.exe 实例）启动后会写就绪标志文件；
-        # 本段轮询该标志（上限 REPLACE_WINDOW_WAIT 轮），确保窗口已完成
-        # 镜像加载，避免此处改名 helper.exe 时窗口尚未就绪。
-        # 每轮 ping 约 1s；窗口缺失/超时则强制开始（回退旧行为）。
-        f'set "WINREADY={_bat_escape(os.path.join(REPLACE_BAT_DIR, REPLACE_WINDOW_READY_FLAG))}"',
-        'set /a WWAIT=0',
-        ':wait_winready',
-        'if exist "%WINREADY%" goto :win_ready',
-        'set /a WWAIT+=1',
-        f'if !WWAIT! GEQ {REPLACE_WINDOW_WAIT} (',
-        f'  echo [%date% %time%] [WARN] 等待窗口就绪超时（{REPLACE_WINDOW_WAIT}s），强制开始 >> "%LOG%"',
-        '  goto :win_ready',
-        ')',
+        # ---- 等待 Helper 进程完全退出 ----
+        # 本批处理由 Helper 的退出路径启动，且仅在内联替换失败时兜底使用。
+        # 先等它彻底退出（含 PyInstaller bootloader 收尾），再开始搬运，
+        # 避免与正在退出的进程争抢文件句柄。
         f'ping 127.0.0.1 -n {REPLACE_INITIAL_WAIT + 1} >nul',
-        'goto :wait_winready',
-        ':win_ready',
-        f'echo [%date% %time%] 进度窗口已就绪，开始替换 >> "%LOG%"',
+        f'echo [%date% %time%] 开始兜底替换 >> "%LOG%"',
         '',
     ]
 
-    # ---- 替换前先处理 helper.exe ----
-    # 目的：helper.exe 属于 KEEP_ITEMS，不会被 clean_dir 标记；
-    # 此处将其改名 .old 腾出文件名，替换阶段才能放回新的 helper.exe。
-    # 只做“标记”（改名），不做删除 —— .old 的删除统一由清理段负责。
-    self_exe = os.path.join(BASE_DIR, SELF_NAME)
-    self_old = self_exe + OLD_SUFFIX
-    L += [
-        ':: ---------- 标记 helper.exe（改名 .old，不删除） ----------',
-        f'set "SELFEXE={_bat_escape(self_exe)}"',
-        f'set "SELFOLD={_bat_escape(self_old)}"',
-        'set /a SELFDEL=0',
-        'set /a DTRY=0',
-        f'if not exist "%SELFEXE%" (',
-        f'  echo [%date% %time%] [SKIP] helper.exe 不存在，无需处理 >> "%LOG%"',
-        '  set /a SELFDEL=1',
-        ')',
-        # 重要：标签必须位于 if 块【外】。cmd 解析带括号的复合块时，
-        # 若块内出现 ":label"，解析器会误认为块提前结束，导致孤立的 ")"
-        # 引发语法错误。goto 只能从块内跳到块外标签（此处唯一 goto 即此用法）。
-        ':retry_selfdel',
-        'if !SELFDEL! EQU 0 (',
-        '  set /a DTRY+=1',
-        # 先清掉可能残留的 .old（必删），避免改名目标被占用
-        '  if exist "%SELFOLD%" del /f /q "%SELFOLD%" >nul 2>&1',
-        '  if exist "%SELFOLD%" (',
-        f'    echo [%date% %time%] [WARN] helper.exe{OLD_SUFFIX} 被占用，放弃标记 >> "%LOG%"',
-        '    set /a SELFDEL=1',
-        '  ) else (',
-        '    move /y "%SELFEXE%" "%SELFOLD%" >nul 2>&1',
-        '    if not exist "%SELFEXE%" (',
-        f'      echo [%date% %time%] [MARK] helper.exe 已标记为 {OLD_SUFFIX}（第 !DTRY! 次尝试） >> "%LOG%"',
-        '      set /a SELFDEL=1',
-        '    ) else (',
-        f'      if !DTRY! GEQ {REPLACE_MAX_RETRY} (',
-        f'        echo [%date% %time%] [WARN] helper.exe 标记失败，重试 !DTRY! 次 >> "%LOG%"',
-        '        set /a SELFDEL=1',
-        '      ) else (',
-        f'        ping 127.0.0.1 -n {REPLACE_RETRY_WAIT + 1} >nul',
-        '        goto :retry_selfdel',
-        '      )',
-        '    )',
-        '  )',
-        ')',
-        '',
-    ]
-
-    # ---- 标记/清理职责分离说明 ----
-    # 注意：不再有"待删清单"段 —— 标记与清理完全分离：
-    # 需要替换/删除的旧文件已由 clean_dir() 统一改名为 *.old，
-    # 此处无清单可读；所有 *.old 的删除统一由本脚本的【清理 .old 残留】段负责。
+    # ---- 说明：此处不再有"标记 helper.exe"段 ----
+    # helper.exe 已由 clean_dir() 在运行中改名成 *.old（Windows 允许重命名
+    # 运行中的可执行文件），原路径已空出，本脚本按普通文件搬运即可。
+    # 同样地，也没有"待删清单"段：所有 *.old 的删除由下次启动 Helper 时的
+    # cleanup_stale_old_files() 完成（那时旧进程已退出，不再有占用）。
 
     # 按批次切分
     batches = [items[i:i + REPLACE_BATCH_SIZE]
@@ -1513,53 +1551,13 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         '',
     ]
 
-    # ---- 清理 .old 残留（【清理】阶段核心） ----
-    # 原理：helper.py 只负责【标记】（改名 .old），删除全部由本段完成。
-    # 进度窗口（第二个 helper.exe 实例）在替换完成后会自行退出并释放句柄，
-    # 因此先等待几秒再扫删，绝大部分 .old 都能一次清干净。
-    # 扫描范围：BASE_DIR 顶层 —— clean_dir 标记的正是顶层项；
-    # _backup 目录内的 *.old 是回滚依据，绝不触碰。
-    # 清理失败绝不触发回滚（！FAIL!不变），残留由下一次更新的清理段再试。
-    L += [
-        ':: ---------- 清理 .old 残留 ----------',
-        f'echo [%date% %time%] 等待进度窗口退出（{OLD_CLEAN_WAIT}s）... >> "%LOG%"',
-        f'ping 127.0.0.1 -n {OLD_CLEAN_WAIT + 1} >nul',
-        f'echo [%date% %time%] 开始清理 .old 残留 >> "%LOG%"',
-        'set /a OLDOK=0',
-        'set /a OLDFAIL=0',
-        # 1) 删除带 .old 后缀的目录（如旧 lib 目录）
-        f'for /d %%D in ("%BASE%\\*{OLD_SUFFIX}") do (',
-        f'  for /l %%R in (1,1,{OLD_DEL_RETRY}) do (',
-        '    if exist "%%D" (',
-        '      rmdir /s /q "%%D" >nul 2>&1',
-        f'      if exist "%%D" ping 127.0.0.1 -n {OLD_DEL_WAIT + 1} >nul',
-        '    )',
-        '  )',
-        '  if exist "%%D" (',
-        f'    echo [%date% %time%] [WARN] %%D 清理失败，下次更新再试 >> "%LOG%"',
-        '    set /a OLDFAIL+=1',
-        '  ) else (',
-        '    set /a OLDOK+=1',
-        '  )',
-        ')',
-        # 2) 删除带 .old 后缀的文件
-        f'for %%F in ("%BASE%\\*{OLD_SUFFIX}") do (',
-        f'  for /l %%R in (1,1,{OLD_DEL_RETRY}) do (',
-        '    if exist "%%F" (',
-        '      del /f /q "%%F" >nul 2>&1',
-        f'      if exist "%%F" ping 127.0.0.1 -n {OLD_DEL_WAIT + 1} >nul',
-        '    )',
-        '  )',
-        '  if exist "%%F" (',
-        f'    echo [%date% %time%] [WARN] %%F 清理失败，下次更新再试 >> "%LOG%"',
-        '    set /a OLDFAIL+=1',
-        '  ) else (',
-        '    set /a OLDOK+=1',
-        '  )',
-        ')',
-        f'echo [%date% %time%] .old 清理完成：成功 !OLDOK! 失败 !OLDFAIL! >> "%LOG%"',
-        '',
-    ]
+    # ---- 清理 .old 残留：不在此处做 ----
+    # 原设计由本段扫删 *.old，但实测进度窗口（第二个 helper.exe 实例）
+    # 退出时机不可控，helper.exe.old / VCRUNTIME140*.dll.old 常因仍被占用
+    # 而删除失败；残留的 helper.exe.old 会让下次更新的标记逻辑"放弃标记"，
+    # 导致新 helper.exe 无法就位、更新静默失败。
+    # 现改为：由下次启动 helper 时（cleanup_stale_old_files）删除 ——
+    # 那时旧进程早已退出，文件不再被占用，删除必然成功。
 
     # 删除备份（仅在无失败时；回滚后需保留备份供用户排查）
     if delete_backup:
@@ -1586,8 +1584,6 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         ':: ---------- 生成报告 ----------',
         f'echo [%date% %time%] ===== 延时替换结束 ===== >> "%LOG%"',
         f'echo 成功=!OK! 失败=!FAIL! 批次=!BATCHNO! >> "%LOG%"',
-        # 清理进度窗口就绪标志（避免残留被下次更新误读）
-        'if exist "%WINREADY%" del /f /q "%WINREADY%" >nul 2>&1',
         '',
         f'echo ============================================ > "%REPORT%"',
         f'echo 延时替换报告 >> "%REPORT%"',
@@ -1609,71 +1605,65 @@ def _gen_replace_batch(items, delete_backup, backup_root):
         f'  echo [警告] 回滚还原不完整，部分文件可能未恢复，请检查 >> "%REPORT%"',
         ')',
         f'echo. >> "%REPORT%"',
-        f'echo 详细日志见: helper.log >> "%REPORT%"',
-        # 不再自删批处理（del "%~f0"）：cmd 逐行读取 bat，执行中删除自身会在
-        # 尾部读取时报"找不到批处理文件"并产生非 0 退出码；bat 放在 temp 目录，
-        # 每次更新覆盖写入同名文件即可，无需自删。
+        f'echo 详细日志见: helper.log（Helper 侧）与 {REPLACE_BATCH_LOG}（批处理侧） >> "%REPORT%"',
     ]
+
+    # ---- 启动主程序 ----
+    # 兜底批处理是"最后一道工序"：Helper 已退出，替换完成（或已回滚）后
+    # 由本脚本启动主程序，保证用户最终一定能看到程序界面。
+    if launch_main:
+        L += [
+            ':: ---------- 启动主程序 ----------',
+            f'echo [%date% %time%] 启动主程序 >> "%LOG%"',
+            f'if exist "{_bat_escape(MAIN_EXE)}" start "" "{_bat_escape(MAIN_EXE)}"',
+            '',
+        ]
 
     return L
 
 
-# 模块级：待启动的延时替换任务（helper 退出后才真正启动批处理+进度窗口）
+# 模块级：待启动的兜底替换任务（helper 退出后才真正启动批处理）
 _pending_replace = False
 _pending_replace_total = 0
 
 
-def schedule_cleanup(delete_backup, target_exe):
-    """生成延时替换批处理，但【不在此启动】—— 启动推迟到 helper 关闭后。
+def schedule_fallback_replace(items, delete_backup):
+    """把"内联替换失败"的项交给退出后的批处理兜底完成，【不在此启动】。
 
-    delete_backup: 是否删除 _backup（只有更新成功才为 True）
-    target_exe:    当前 Helper 可执行文件路径（保留参数以兼容调用方）
+    正常路径下 replace_staged() 已把全部文件落位，不会走到这里；只有当
+    某些文件在 Helper 运行期间被占用、重试后仍失败时才调用本函数：
+    Helper 退出后这些占用通常随之释放，独立 cmd 进程可以再试一次；
+    若批处理仍失败，则从 _backup 回滚。
 
-    返回：是否已调度替换任务。True 表示由批处理/进度窗口负责收尾
-    （进度窗口会在替换完成后启动主程序），调用方不应再直接启动主程序。
+    items:         [(相对路径, 规则说明)]，仅含内联阶段失败的项
+    delete_backup: 是否在成功后删除 _backup（仅更新成功路径为 True）
 
-    批处理以独立 cmd 进程运行，由 main() 的退出路径 _flush_pending_replace()
-    在 helper 关闭后启动（批处理自身还会先轮询等待主 Helper 进程消失）。
+    返回：是否已成功生成兜底批处理。
     """
     backup_root = os.path.join(BASE_DIR, BACKUP_DIR_NAME)
     manifest_path = os.path.join(BASE_DIR, REPLACE_MANIFEST)
-    items = _read_manifest()
     has_backup = delete_backup and os.path.isdir(backup_root)
 
-    log(f'延时替换检查：待替换={len(items)} 项 | 删备份={has_backup}')
-
     if not items:
-        # 无待替换项：一律不调度（返回 False 让调用方直接启动主程序）。
-        # 注意不能写成 "not items and not has_backup" —— 那样在"清单为空但
-        # 备份仍在"时会返回 True，而 _flush_pending_replace() 对 total<=0
-        # 直接 return，批处理与进度窗口都不会启动，导致主程序永不启动。
         _remove_manifest(manifest_path)
-        if has_backup:
-            # 无替换任务却残留备份：顺手清掉，避免 _backup 永久占用磁盘
-            shutil.rmtree(backup_root, ignore_errors=True)
-            log(f'无待替换项，已清理残留备份：{backup_root}', level='WARN')
-        log('无需调度延时替换', level='DEBUG')
+        log('无待兜底项，不调度批处理', level='DEBUG')
         return False
 
     # 批处理放在 BASE_DIR 之外：回滚时会用 for 循环清空 BASE_DIR，
-    # 若批处理在里面会被自己删掉，导致后续步骤（xcopy 还原）无法执行。
+    # 若批处理在里面会被自己删掉，导致后续 xcopy 还原无法执行。
     os.makedirs(REPLACE_BAT_DIR, exist_ok=True)
     bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
-    lines = _gen_replace_batch(items, has_backup, backup_root)
+    lines = _gen_replace_batch(items, has_backup, backup_root, launch_main=True)
 
     try:
         with open(bat_path, 'w', encoding='gbk') as f:
             f.write('\r\n'.join(lines) + '\r\n')
-        log(f'已写入延时替换批处理：{bat_path}（{len(lines)} 行）', level='DEBUG')
-        # 清单内容已完整编译进批处理，生成后立即删除：
-        # 否则残留清单会在下次启动时被读到，误触发整套替换流程
-        # （把 helper.exe 改名 .old 后当垃圾清掉，且无备份可回滚）。
-        _remove_manifest(manifest_path)
+        log(f'已写入兜底替换批处理：{bat_path}（{len(lines)} 行）')
         # 仅记录待启动，真正 Popen 交给 helper 关闭时的 _flush_pending_replace()
         _set_pending_replace(True, len(items))
         return True
     except Exception as e:
-        log_exc(f'写入延时替换批处理失败：{e}')
+        log_exc(f'写入兜底替换批处理失败：{e}')
         return False
 
 
@@ -1685,11 +1675,11 @@ def _set_pending_replace(ready, total):
 
 
 def _flush_pending_replace():
-    """在 helper 关闭后启动进度窗口与批处理（供 main() 的 finally 调用）。
+    """在 helper 关闭后启动兜底批处理（供 main() 的 finally 调用）。
 
-    顺序：先启动进度窗口（从 BASE_DIR 加载旧 helper.exe 镜像），
-    再启动批处理 —— 批处理首段轮询窗口就绪标志文件，
-    等窗口完成启动后才改名 helper.exe，避免文件名竞态。
+    只会在"内联替换失败"时走到这里：Helper 退出后文件占用通常随之释放，
+    独立的 cmd 进程可再试一次；批处理末尾会启动主程序，保证用户最终
+    一定能看到程序界面（正常路径不经过这里，主程序由 Helper 直接启动）。
     """
     global _pending_replace
     if not _pending_replace:
@@ -1699,10 +1689,6 @@ def _flush_pending_replace():
     if total <= 0:
         return
 
-    # 先拉起替换进度窗口（独立进程，替换完成后由它启动主程序）
-    log_pos = _log_size(os.path.join(BASE_DIR, 'helper.log'))
-    _spawn_replace_window(total, log_pos)
-
     try:
         bat_path = os.path.join(REPLACE_BAT_DIR, REPLACE_BAT)
         proc = subprocess.Popen(
@@ -1710,209 +1696,14 @@ def _flush_pending_replace():
             cwd=BASE_DIR,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         )
-        batches = (total + REPLACE_BATCH_SIZE - 1) // REPLACE_BATCH_SIZE
-        log(f'已调度延时替换（PID={proc.pid}，{total} 个文件，'
-            f'{batches} 个批次）')
+        log(f'已启动兜底替换批处理（PID={proc.pid}，{total} 个文件）')
     except Exception as e:
-        log_exc(f'调度延时替换失败：{e}')
-
-
-def _spawn_replace_window(total, log_pos=0):
-    """以独立进程启动替换进度窗口。
-
-    用自身 exe / pythonw 加 --replace-window 参数启动，避免依赖控制台。
-    log_pos 为 helper.log 的起读偏移（启动批处理前的字节大小），
-    保证窗口只统计本次替换产生的日志行。
-    """
-    if total <= 0:
-        return
-    try:
-        if getattr(sys, 'frozen', False):
-            # 打包后：用自身 exe 带参数启动
-            cmd = [sys.executable, '--replace-window', str(total), str(log_pos)]
-        else:
-            # 源码运行：用 pythonw 避免弹出控制台
-            pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
-            exe = pyw if os.path.exists(pyw) else sys.executable
-            cmd = [exe, os.path.abspath(__file__), '--replace-window', str(total),
-                   str(log_pos)]
-        subprocess.Popen(cmd, cwd=BASE_DIR)
-        log(f'已启动替换进度窗口（共 {total} 个文件，日志起读偏移 {log_pos}）')
-    except Exception as e:
-        log_exc(f'启动替换进度窗口失败：{e}')
+        log_exc(f'启动兜底替换批处理失败：{e}')
 
 
 # ---------------------------------------------------------------------------
-# 替换进度窗口：显示替换进度，完成后启动主程序
+# 主程序管理：探测 / 关闭 / 启动
 # ---------------------------------------------------------------------------
-
-class ReplaceProgressWindow:
-    """替换进度窗口。
-
-    在 Helper 退出后由独立进程运行，从 helper.log 的起读偏移开始
-    增量读取，显示本次替换进度，完成后自动启动主程序并关闭窗口。
-    """
-
-    def __init__(self, total, main_exe, log_pos=0):
-        self.total = total
-        self.main_exe = main_exe
-        self.done = 0
-        self.failed = 0
-        self.finished = False
-        self.rolling_back = False
-        self.rolled_back = False
-        # 是否已收到批处理的结束标志（"延时替换结束"）。
-        # 兜底收尾必须等它出现：失败时 done+failed 会在批处理写回滚标志
-        # 之前就达到 total，若据此提前收尾，窗口会误判为"更新完成"并
-        # 启动半损坏的主程序，与正在进行的回滚竞争。
-        self.saw_end = False
-        # 只统计本批次新增日志：历史 [OK]/[FAIL] 行不得计入，
-        # 否则计数虚高会导致窗口提前收尾（launch 旧主程序）。
-        if log_pos > 0:
-            self._log_pos = log_pos
-        else:
-            self._log_pos = _log_size(os.path.join(BASE_DIR, 'helper.log'))
-
-        self.root = tk.Tk()
-        self.root.title(REPLACE_WIN_TITLE)
-        self.root.resizable(False, False)
-        self.root.configure(bg=BG)
-        self.root.protocol('WM_DELETE_WINDOW', lambda: None)  # 禁止手动关闭
-
-        w, h = REPLACE_WIN_W, REPLACE_WIN_H
-        self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() - w) // 2
-        y = (self.root.winfo_screenheight() - h) // 2
-        self.root.geometry(f'{w}x{h}+{x}+{y}')
-
-        tk.Label(self.root, text='正 在 完 成 更 新',
-                 font=('Microsoft YaHei', 16, 'bold'),
-                 bg=BG, fg=FG).pack(pady=(22, 4))
-
-        self.status = tk.Label(self.root, text='正在替换文件...',
-                               font=('Microsoft YaHei', 10), bg=BG, fg=MUTED)
-        self.status.pack()
-
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure('Replace.Horizontal.TProgressbar',
-                        troughcolor='#3d3d52', background=ACCENT,
-                        bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT)
-        self.progress = ttk.Progressbar(
-            self.root, style='Replace.Horizontal.TProgressbar',
-            length=380, mode='determinate', maximum=max(total, 1))
-        self.progress.pack(pady=(18, 8))
-
-        self.detail = tk.Label(self.root, text=f'0 / {total}',
-                               font=('Microsoft YaHei', 10), bg=BG, fg=FG)
-        self.detail.pack()
-
-        # 最近几行日志
-        self.log_box = tk.Text(self.root, height=5, width=54,
-                               font=('Consolas', 8), bg='#23232f', fg=MUTED,
-                               relief='flat', state='disabled', wrap='none')
-        self.log_box.pack(pady=(12, 0))
-
-        self.root.after(REPLACE_WIN_POLL_MS, self._poll)
-
-    def _append_log(self, text):
-        self.log_box.config(state='normal')
-        self.log_box.insert('end', text + '\n')
-        self.log_box.see('end')
-        self.log_box.config(state='disabled')
-
-    def _poll(self):
-        """轮询 helper.log 增量，更新进度。"""
-        log_path = os.path.join(BASE_DIR, 'helper.log')
-        lines, self._log_pos = read_log_lines(log_path, self._log_pos)
-        for line in lines:
-            kind = classify_replace_log_line(line)
-            if kind == 'ok':
-                self.done += 1
-                self._append_log(line)
-            elif kind == 'fail':
-                self.failed += 1
-                self._append_log(line)
-            elif kind in ('skip', 'mark', 'rollback', 'batch'):
-                if kind == 'rollback':
-                    self.rolling_back = True
-                self._append_log(line)
-            elif kind == 'end':
-                # 批处理已打印结束标志：准确感知替换完成（不依赖批处理自删事件，
-                # 即使 del "%~f0" 失败也能正常收尾，避免与清理阶段循环等待）
-                self.saw_end = True
-                self._finish()
-                return
-
-        self.progress['value'] = self.done + self.failed
-        if self.rolling_back:
-            self.status.config(text='替换失败，正在回滚...', fg='#ffb86c')
-        self.detail.config(
-            text=f'{self.done + self.failed} / {self.total}'
-                 + (f'（失败 {self.failed}）' if self.failed else ''))
-
-        # 兜底结束条件：所有文件都已计数【且】已收到结束标志时才收尾。
-        # 不能只看计数 —— 失败时 done+failed 会在批处理写回滚标志之前
-        # 就达到 total，提前收尾会误判为"更新完成"并启动半损坏的主程序。
-        if (self.done + self.failed) >= self.total and self.saw_end:
-            self._finish()
-            return
-
-        self.root.after(REPLACE_WIN_POLL_MS, self._poll)
-
-    def _finish(self):
-        if self.finished:
-            return
-        self.finished = True
-        self.progress['value'] = self.total
-
-        # 回滚标记文件存在 -> 已回滚
-        flag = os.path.join(BASE_DIR, REPLACE_ROLLBACK_FLAG)
-        self.rolled_back = os.path.exists(flag)
-
-        if self.rolled_back:
-            self.status.config(text='更新失败，已回滚，正在启动旧版本...',
-                               fg='#ffb86c')
-        elif self.failed:
-            self.status.config(
-                text=f'更新完成（{self.failed} 个文件未能替换）', fg='#ffb86c')
-        else:
-            self.status.config(text='更新完成，正在启动程序...', fg='#7ee787')
-
-        self.detail.config(
-            text=f'{self.done + self.failed} / {self.total}'
-                 + (f'（失败 {self.failed}）' if self.failed else ''))
-        self.root.update_idletasks()
-        self.root.after(REPLACE_WIN_LAUNCH_DELAY_MS, self._launch)
-
-    def _launch(self):
-        """启动主程序并关闭窗口。"""
-        try:
-            if os.path.exists(self.main_exe):
-                subprocess.Popen([self.main_exe], cwd=BASE_DIR)
-        except Exception:
-            pass
-        self.root.destroy()
-
-    def run(self):
-        self.root.mainloop()
-
-
-def run_replace_window(total, main_exe, log_pos=0):
-    """以独立进程运行替换进度窗口。
-
-    启动后立即写入"就绪标志"，批处理首段据此得知窗口已完成镜像加载
-    （不会在窗口尚未就绪时改名 helper.exe），见 _gen_replace_batch()。
-    """
-    try:
-        os.makedirs(REPLACE_BAT_DIR, exist_ok=True)
-        ready_flag = os.path.join(REPLACE_BAT_DIR, REPLACE_WINDOW_READY_FLAG)
-        with open(ready_flag, 'w', encoding='utf-8') as f:
-            f.write(str(os.getpid()))
-        ReplaceProgressWindow(total, main_exe, log_pos).run()
-    except Exception:
-        pass
-
 
 def is_main_running():
     """探测主程序是否在运行：尝试拿主程序的 Mutex。
@@ -1944,6 +1735,10 @@ def kill_main(wait=5):
         )
         output = result.stdout.decode('gbk', errors='replace').strip()
         log(f'taskkill 返回码={result.returncode} | 输出：{output}', level='DEBUG')
+    except subprocess.TimeoutExpired:
+        # taskkill 自身超时（subprocess 已终止该命令）：不能直接判定失败 ——
+        # 主程序可能正在退出中，转入下面的轮询确认真实状态
+        log(f'taskkill 超时（{wait}s），转入轮询确认主程序状态', level='WARN')
     except Exception as e:
         log_exc(f'终止主程序失败：{e}')
         return False
@@ -1981,7 +1776,10 @@ class HelperApp:
 
     def __init__(self, root):
         self.root = root
-        self.update_success = False
+        # 退出时是否需要由 Helper 启动主程序：
+        #   True  -> 由 Helper 启动（正常路径 / 出错回落）
+        #   False -> 不启动（主程序已在运行，或已交给兜底批处理启动）
+        self.launch_after = True
 
         self.root.title('随机点名工具 - 启动器')
         self.root.resizable(False, False)
@@ -2028,7 +1826,41 @@ class HelperApp:
     def set_progress(self, value):
         self.progress['value'] = value * 100
 
+    def _ui(self, fn, *args):
+        """线程安全地更新界面。
+
+        check() 跑在后台线程，而 tkinter 的 after 只能从主线程调用；
+        用户在流程进行中关闭窗口后 root 已销毁，再调用会抛
+        RuntimeError: main thread is not in main loop。
+        这里统一吞掉该异常：UI 更新失败不应中断更新流程本身
+        （关键动作如"启动主程序"并不依赖 UI）。
+        """
+        try:
+            self.root.after(0, lambda: fn(*args))
+        except (RuntimeError, tk.TclError):
+            pass
+
     def check(self):
+        """后台线程入口：保证任何异常都不会吃掉"最终启动主程序"这一步。
+
+        _check_impl() 只负责流程；所有出口统一收敛到 finally 的
+        enable_start()（800ms 后 auto_launch），避免中途异常导致
+        窗口永久停在半途、主程序不被启动。
+        """
+        try:
+            self._check_impl()
+        except Exception as e:
+            log_exc(f'检查更新流程异常：{e}')
+            self._ui(self.set_status, '更新失败，将直接启动程序', '#ffb86c')
+        finally:
+            self._ui(self.enable_start)
+
+    def _check_impl(self):
+        """检查更新并应用更新。
+
+        硬约束：每个失败分支都必须落到"回滚"或"明确的失败态"，
+        不允许带着"一半新、一半 *.old"的目录状态去启动主程序。
+        """
         import time as _t
         t0 = _t.time()
         log('=' * 60)
@@ -2037,8 +1869,7 @@ class HelperApp:
         remote_tag = get_latest_tag()
         if not remote_tag:
             log('无法获取最新版本（atom 获取失败），跳过更新', level='WARN')
-            self.root.after(0, lambda: self.set_status('无法连接 GitHub', '#ffb86c'))
-            self.root.after(0, self.enable_start)
+            self._ui(self.set_status, '无法连接 GitHub', '#ffb86c')
             return
 
         log(f'远端最新版本：{remote_tag}')
@@ -2046,32 +1877,33 @@ class HelperApp:
         # 版本号比较（不走 API，无速率限制）
         if not _version_gt(remote_tag, LOCAL_VERSION):
             log(f'已是最新版本（本地 {LOCAL_VERSION} >= 远端 {remote_tag}）')
-            self.root.after(0, lambda: self.set_status('已是最新版本', '#7ee787'))
-            self.root.after(0, self.enable_start)
+            if is_main_running():
+                # 主程序已在运行：本次属于"误触启动器"，直接退出即可，
+                # 不再拉起第二个实例（否则会被主程序单实例锁拦下并弹窗打扰）
+                log('主程序已在运行，本次不再重复启动', level='WARN')
+                self.launch_after = False
+                self._ui(self.set_status, '程序已在运行', '#7ee787')
+            else:
+                self._ui(self.set_status, '已是最新版本', '#7ee787')
             return
 
         log(f'发现新版本：{LOCAL_VERSION} -> {remote_tag}')
         zip_url = _asset_url(remote_tag, ZIP_ASSET_NAME)
         log(f'更新包地址：{zip_url}')
 
-        # 更新前先确保主程序已退出，否则主程序占用的 DLL 会导致清理失败
+        # 更新前先确保主程序已退出：主程序占用的 DLL 会阻碍改名与替换
         if is_main_running():
-            self.root.after(0, lambda: self.set_status('正在关闭主程序...'))
+            self._ui(self.set_status, '正在关闭主程序...')
             log('主程序在运行，尝试终止', level='WARN')
             if not kill_main():
                 log('无法关闭主程序，放弃更新', level='ERROR')
-                self.root.after(0, lambda: self.set_status(
-                    '请先关闭主程序后重试', '#ffb86c'))
-                self.root.after(0, self.enable_start)
+                self._ui(self.set_status, '请先关闭主程序后重试', '#ffb86c')
                 return
             log('主程序已退出')
         else:
             log('主程序未运行，直接更新')
 
-        # 说明：不再阻塞等待 DLL 释放。新版本先解压到 _staging，
-        # 被占用的文件由退出后的 _replace.bat 分批替换，无需在此等待。
-
-        self.root.after(0, lambda: self.set_status(f'发现新版本 {remote_tag}，下载中...'))
+        self._ui(self.set_status, f'发现新版本 {remote_tag}，下载中...')
         zip_path = os.path.join(BASE_DIR, 'app.zip')
         t = _t.time()
         # 进度回调收到的是"已下载字节数"，这里换算成比例。
@@ -2080,7 +1912,7 @@ class HelperApp:
 
         def on_progress(done):
             if total_size[0]:
-                self.root.after(0, lambda: self.set_progress(done / total_size[0]))
+                self._ui(self.set_progress, done / total_size[0])
 
         def on_size(total):
             total_size[0] = total
@@ -2091,11 +1923,15 @@ class HelperApp:
             log(f'下载完成，耗时 {_t.time() - t:.2f}s')
         except Exception as e:
             log_exc(f'下载失败：{e}')
-            self.root.after(0, lambda: self.set_status('下载失败', '#ff7b72'))
-            self.root.after(0, self.enable_start)
+            self._ui(self.set_status, '下载失败', '#ff7b72')
             return
 
-        self.root.after(0, lambda: self.set_status('正在应用更新...'))
+        # ---- 应用更新：备份 -> 全部改名 *.old（含 helper.exe 自身）-> 解压到 _staging
+        # 说明：不需要等待任何进程退出。Windows 允许重命名运行中的可执行文件，
+        # 因此 Helper 在自己运行期间就能腾出全部目标文件名（含自身），
+        # 随后内联把新文件搬到原路径，无需独立进程与"退出后批处理"。
+        self._ui(self.set_status, '正在应用更新...')
+        self._ui(self.set_progress, 0)
         ok, msg = apply_update(zip_path)
 
         if os.path.exists(zip_path):
@@ -2105,33 +1941,68 @@ class HelperApp:
             except OSError as e:
                 log(f'删除更新包失败：{e}', level='WARN')
 
-        if ok:
-            self.update_success = True
-            log(f'更新成功！版本：{remote_tag} | 总耗时 {_t.time() - t0:.2f}s')
-            self.root.after(0, lambda: self.set_status(
-                f'更新完成（{remote_tag}）', '#7ee787'))
-        else:
+        if not ok:
             log(f'更新失败：{msg} | 总耗时 {_t.time() - t0:.2f}s', level='ERROR')
-            self.root.after(0, lambda: self.set_status(msg, '#ffb86c'))
+            self._ui(self.set_status, msg, '#ffb86c')
+            return
 
-        self.root.after(0, self.enable_start)
+        # ---- 内联替换：原路径已空出，直接把 _staging 里的新文件搬过去
+        items = _read_manifest()
+        # 清单已读入内存，立即删除，避免残留清单在下次启动时被误读为有任务
+        _remove_manifest(os.path.join(BASE_DIR, REPLACE_MANIFEST))
+        backup_root = os.path.join(BASE_DIR, BACKUP_DIR_NAME)
+
+        if not items:
+            # 此时原文件已被改成 *.old；若没有任何待替换项却按"成功"继续，
+            # 会删掉 _backup 与 _staging，目录被清空且无法恢复 —— 必须回滚。
+            log('替换清单为空（无待替换项），判定更新失败并回滚', level='ERROR')
+            rollback(backup_root)
+            self._ui(self.set_status, '更新失败，已回滚', '#ffb86c')
+            return
+
+        log(f'内联替换开始：{len(items)} 项')
+
+        def on_replace(done, total, rel):
+            self._ui(self.set_status, f'正在替换 {done}/{total}：{rel}')
+            if total:
+                self._ui(self.set_progress, done / total)
+
+        ok2, failed = replace_staged(items, progress_cb=on_replace)
+        if ok2:
+            # 全部落位成功：清掉备份与暂存目录（暂存里可能残留空目录），
+            # 退出时由 Helper 启动主程序
+            shutil.rmtree(backup_root, ignore_errors=True)
+            shutil.rmtree(os.path.join(BASE_DIR, STAGING_DIR),
+                          ignore_errors=True)
+            self._ui(self.set_status, f'更新完成（{remote_tag}）', '#7ee787')
+            self._ui(self.set_progress, 1)
+            log(f'更新成功！版本：{remote_tag} | 总耗时 {_t.time() - t0:.2f}s')
+            return
+
+        # 重试后仍失败：交给退出后的批处理兜底（由它负责启动主程序）
+        log(f'内联替换仍有 {len(failed)} 项失败，交由批处理兜底', level='WARN')
+        if schedule_fallback_replace(failed, delete_backup=True):
+            self.launch_after = False
+            self._ui(self.set_status, '部分文件被占用，即将退出后完成更新...',
+                     '#ffb86c')
+            return
+
+        # 无兜底可用：绝不能带着"一半新、一半 *.old"的状态启动主程序，必须回滚
+        log('兜底批处理生成失败，执行回滚', level='ERROR')
+        rollback(backup_root)
+        self._ui(self.set_status, f'更新失败，已回滚（{len(failed)} 项未替换）',
+                 '#ffb86c')
 
     def enable_start(self):
         self.btn.config(text='启动中...')
         self.root.after(800, self.auto_launch)
 
     def auto_launch(self):
-        log('准备启动主程序')
-        # 先判定是否确有替换/清理任务：有则交由批处理 + 进度窗口收尾
-        # （进度窗口会在替换完成后启动主程序），无则直接启动主程序。
-        # 顺序必须是"先调度、看返回值"，不能"先调度、再查清单"——
-        # 残留清单会让后者误判为有任务。
-        scheduled = schedule_cleanup(
-            delete_backup=self.update_success,
-            target_exe=os.path.join(BASE_DIR, SELF_NAME),
-        )
-        if not scheduled:
+        if self.launch_after:
+            log('准备启动主程序')
             launch_main()
+        else:
+            log('无需启动主程序（已在运行或已交给兜底批处理）', level='DEBUG')
         log('Helper 即将退出')
         self.root.destroy()
 
@@ -2139,20 +2010,6 @@ class HelperApp:
 def main():
     # 在自身 _MEI 里写标记，供下次启动识别并清理本程序残留的临时目录
     _mark_mei()
-    # 替换进度窗口模式（由 Helper 以独立进程拉起）
-    if '--replace-window' in sys.argv:
-        idx = sys.argv.index('--replace-window')
-        try:
-            total = int(sys.argv[idx + 1])
-        except (IndexError, ValueError):
-            total = 0
-        try:
-            log_pos = int(sys.argv[idx + 2])
-        except (IndexError, ValueError):
-            log_pos = 0
-        run_replace_window(total, MAIN_EXE, log_pos)
-        return
-
     log_env()
     # 单实例检查：已有实例在运行则立即退出
     if not _instance_lock.acquire():
@@ -2160,8 +2017,10 @@ def main():
         sys.exit(0)
 
     # 拿到唯一实例资格后，清理上次运行残留的 _MEI 垃圾目录
-    # （注意：*.old 文件不属于这里 —— 那由批处理【清理】阶段负责）
     cleanup_stale_mei()
+    # 清理上次更新残留的 *.old（【清理】阶段）—— 此时旧进程已退出，
+    # 文件不再被占用，删除必然成功；残留的 helper.exe.old 会导致下次更新失败
+    cleanup_stale_old_files()
     # 兜底清理上次异常中断残留的替换状态文件与暂存目录，
     # 避免残留清单在"已是最新版本"时误触发替换流程
     cleanup_stale_replace_files()
@@ -2178,7 +2037,7 @@ def main():
         raise
     finally:
         _instance_lock.release()
-        # helper 关闭后：启动延时替换批处理（独立 cmd 进程）与进度窗口
+        # 仅在内联替换失败时才会启动兜底批处理（独立 cmd 进程）
         _flush_pending_replace()
         log('Helper 已退出')
 

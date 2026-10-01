@@ -56,7 +56,7 @@ def main():
     remote_tag = get_latest_tag()
     if not remote_tag:
         print('  FAIL 无法获取最新 tag')
-        return
+        sys.exit(1)
     print(f'  OK 最新版本：{remote_tag}')
 
     print('\n[3] 版本比较结果 ...')

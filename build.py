@@ -66,6 +66,11 @@ def build_main():
 
 if __name__ == '__main__':
     args = sys.argv[1:]
+    # --all 与具体目标互斥：混用时"到底编译哪个"不可预期，直接拒绝而不是静默取其一
+    if '--all' in args and ('--helper' in args or '--main' in args):
+        print('参数冲突：--all 不能与 --helper / --main 同时使用')
+        sys.exit(2)
+
     build_all = not args or '--all' in args
     build_h = build_all or '--helper' in args
     build_m = build_all or '--main' in args
@@ -74,6 +79,11 @@ if __name__ == '__main__':
         build_main()
     if build_h:
         build_helper()
+
+    # 输出目录不存在时（首次打包失败/参数写错）直接给出可读提示，避免 listdir 抛栈
+    if not os.path.isdir(OUT_DIR):
+        print(f'输出目录不存在（打包可能失败）：{OUT_DIR}')
+        sys.exit(1)
 
     print(f'\n打包完成：{OUT_DIR}/')
     for f in sorted(os.listdir(OUT_DIR)):
