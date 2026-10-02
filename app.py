@@ -14,8 +14,10 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-os.makedirs(DATA_DIR, exist_ok=True)
 FILE_LIST = os.path.join(DATA_DIR, 'file.txt')
+# 数据目录的创建放到 _ensure_data_dir()（在 __main__ 起始处调用）：
+# 那里已有 log()，可以把"data 位置是文件 / 无写权限"转成明确提示，
+# 而不是在导入期抛 FileExistsError 堆栈。
 
 # 日志文件与轮转阈值（超过后轮转为 app.log.1，只保留一代）
 LOG_FILE = os.path.join(BASE_DIR, 'app.log')
@@ -61,6 +63,32 @@ def log_exc(msg):
     """记录异常及其完整堆栈，便于定位问题。"""
     import traceback
     log(f'{msg}\n{traceback.format_exc()}', level='ERROR')
+
+
+def _ensure_data_dir():
+    """确保数据目录可用；不可用时给出可见提示并退出。
+
+    os.makedirs(..., exist_ok=True) 只容忍"已存在的目录"：若 data 这个位置上
+    实际是个文件（或当前用户对该位置无写权限），它会抛 FileExistsError /
+    PermissionError，程序带着堆栈直接起不来、用户看不到任何原因。这里把它
+    转成日志 + 明确的弹窗提示。
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        return
+    except OSError as e:
+        log_exc(f'数据目录不可用：{DATA_DIR}：{e}')
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f'数据目录不可用：\n{DATA_DIR}\n\n'
+                f'请确认该位置不是同名文件，且当前用户有写入权限。\n\n'
+                f'错误：{e}',
+                '随机点名工具', 0x10)      # 0x10 = MB_ICONERROR
+        except Exception as inner:
+            log(f'弹出提示框失败：{inner}', level='WARN')
+        sys.exit(1)
 
 
 def log_env():
@@ -1449,6 +1477,8 @@ HTML = r"""<!DOCTYPE html>
 
 
 if __name__ == '__main__':
+    # 先确保数据目录可用：不可用时给出明确提示并退出，而不是抛堆栈
+    _ensure_data_dir()
     log_env()
     # 单实例检查：已有实例在运行则立即退出
     if not _instance_lock.acquire():

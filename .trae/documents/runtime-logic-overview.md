@@ -76,6 +76,8 @@
 ## 3. 链路二：主程序（RandomNamePicker.exe）
 
 ```
+_ensure_data_dir()   数据目录不可用（同名文件 / 无写权限）→ 提示 + sys.exit(1)
+      ↓
 Mutex 获取失败 → MessageBoxW("程序已在运行") → sys.exit(0)
 Mutex 获取成功 ↓
 webview.create_window(html=HTML, js_api=Api()) → webview.start()
