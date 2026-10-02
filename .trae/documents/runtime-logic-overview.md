@@ -28,10 +28,25 @@
 | `_staging/` | 更新中间态 | 解压后创建 → 替换成功 / 回滚 / 下次启动清理 |
 | `*.old` | 更新中间态 | 标记阶段生成 → **下次启动** helper 时删除 |
 | `_replace_manifest.txt` | 状态 | `safe_extract()` 写 → `check()` 读后立即删 |
-| `_marked_manifest.txt` | 状态 | `clean_dir()` 写 → 下次启动 `cleanup_stale_old_files()` 用后删 |
 | `_replace_rollback.flag` | 状态 | 兜底批处理回滚时写 → 下次启动清理 |
 | `_replace_report.txt` | 报告 | 兜底批处理写 → 保留（不删） |
 | `%TEMP%\RandomNamePickerReplace\_replace.bat` | 兜底脚本 | 仅在「内联替换失败」时生成；放在程序目录之外，避免回滚时被自己删掉 |
+
+**保留白名单 `KEEP_ITEMS` —— 所有「改名 / 删除 / 覆盖」操作的唯一来源**：
+`data`、`app.log`、`app.log.1`、`helper.log`、`helper_batch.log`、`_replace_report.txt`、
+`_backup`、`app.zip`（= `ZIP_ASSET_NAME`，下载名与保留项共用同一常量）。
+其余顶层内容一律视为包内容物 —— 标记阶段改名 `*.old`，下次启动按后缀扫描删除
+（**不依赖任何状态文件**）。
+
+条目的两种形态互不干扰：**不含分隔符**（如 `app.log`）匹配顶层同名项及其下全部内容；
+**含分隔符**（如 `data/notes.txt`）只匹配该路径自身及其子树。
+新增需要保护的东西时**只改这一处** —— 历史教训：保留判断曾分散在 `clean_dir`、
+`rollback`、兜底批处理、替换规则四处，导致同一文件在不同路径下保留语义不一致。
+
+> 取舍说明：早期版本用 `_marked_manifest.txt` 记录"本程序标记过哪些项"来做精确清理，
+> 以免误删用户自有的 `.old`。实测表明该状态文件带来的失败模式（清单缺失）后果可自愈
+> （残留会被下一轮 `clean_dir` 的 `os.remove(同名 .old)` 顺带清掉、且不会阻塞标记），
+> 收益不足以抵消"多一个状态文件"的成本，故简化为按后缀扫描。约定：**用户数据放 `data/`**。
 
 ---
 
@@ -44,7 +59,7 @@
 2. log_env()                      记录环境（版本/PID/BASE_DIR/Mutex 名）
 3. _instance_lock.acquire()       抢 Helper Mutex —— 失败即退出（防重复更新）
 4. cleanup_stale_mei()            删除上次残留的 _MEI 临时目录（校验标记 + 年龄门槛）
-5. cleanup_stale_old_files()      删除上次标记的 *.old（只删 _marked_manifest.txt 里列出的）
+5. cleanup_stale_old_files()      删除顶层全部 *.old（按后缀扫描，不依赖状态文件）
 6. cleanup_stale_replace_files()  清理残留状态文件与 _staging（批处理存在则跳过）
 7. atexit.register(release)       兜底释放锁
 8. tk.Tk() → HelperApp → mainloop 进入 GUI
@@ -123,8 +138,10 @@ finally: 释放 Mutex
 3. **回滚必须还原自身**：`rollback()` 的还原段**不得**跳过 `helper.exe` ——
    标记阶段已把它改名成 `.old`，原路径是空的，写入完全合法（运行中的镜像由
    已映射句柄持有，与路径无关）。跳过它 = 更新器永久消失。
-4. **清理必须精确**：只删除 `_marked_manifest.txt` 列出的 `*.old`，
-   不碰用户自己放在程序目录里的 `.old` 文件。
+4. **保留只有一份定义**：`KEEP_ITEMS` 是「改名 / 删除 / 覆盖」的唯一白名单 ——
+   `clean_dir()`、`rollback()` 的清空段与还原段、兜底批处理的守卫、
+   `classify_files()` 全部查它。约定用户数据只放 `data/`；顶层 `*.old` 一律删除
+   （按后缀扫描，不依赖状态文件）。代价：用户自行放在程序目录里的 `*.old` 会被清掉。
 
 ### 4.3 UI 线程安全
 
@@ -171,14 +188,23 @@ tag 取最大者，不能只看第一条。
 | 文件 | 写 | 读 | 删 | 时机 |
 |---|---|---|---|---|
 | `_replace_manifest.txt` | `safe_extract()` | `check()` | `check()` | 读入内存后立即 |
-| `_marked_manifest.txt` | `clean_dir()` | `cleanup_stale_old_files()` | 清理函数 | 全部删除成功后（有残留则回写剩余项） |
 | `_replace_rollback.flag` | 兜底批处理 | 人工排查 | `cleanup_stale_replace_files()` | 下次启动 |
 | `_replace_report.txt` | 兜底批处理 | 人工排查 | 不删 | — |
 | `_staging/` | `safe_extract()` | `replace_staged()` | 成功 / 回滚 / 兜底 / 下次启动 | — |
 | `_backup/` | `apply_update()` | `rollback()` | 更新成功时；失败保留 | — |
 
+`*.old` 不是状态文件：它由 `clean_dir()` 按后缀产生、由 `cleanup_stale_old_files()`
+按后缀扫描清除，**无需记录"谁标记过"**。
+
+「某个文件是否保留（不改名 / 不删除 / 不覆盖）」也不在本表 —— 统一由 `KEEP_ITEMS`
+决定（见 §1）。
+
+> 已知差异（本次未改）：兜底批处理的**还原**段仍用 `xcopy /e /i /y` 整体回拷
+> （只有清空段查了白名单），因此该路径会用 `_backup` 里的旧日志覆盖当前日志。
+> 影响仅限日志证据，且只在「内联替换失败 → 兜底批处理也回滚」的罕见路径触发。
+
 「漏删」是历史上出过事故的地方（残留清单会被下次启动误读为有替换任务），
-因此这六项统一在 `cleanup_stale_replace_files()` 与 `rollback()` 两处收口。
+因此上表各项统一在 `cleanup_stale_replace_files()` 与 `rollback()` 两处收口。
 
 ---
 
