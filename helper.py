@@ -55,11 +55,8 @@ MAIN_EXE = os.path.join(BASE_DIR, 'RandomNamePicker.exe')
 # 当前版本号（硬编码，每次发版时同步更新）
 LOCAL_VERSION = 'v1.5.a'
 
-# 更新时【原样保留】的内容（不改名、不删除、不覆盖）。
-# 注意：helper.exe 不在此列 —— 它需要在运行中被改名成 *.old 以腾出文件名
-# （Windows 允许重命名运行中的可执行文件，镜像仍由已映射的句柄持有），
-# 新版本随后直接落位到原路径，无需等待进程退出。
-KEEP_ITEMS = {'data'}
+# 注：更新时"原样保留"的白名单 KEEP_ITEMS 定义见下方「保留白名单」一节
+#     （它在所有被引用的常量之后定义，以保证全局只有一份来源）。
 
 # 备份目录名（仅失败回滚用，更新成功后由批处理删除）
 BACKUP_DIR_NAME = '_backup'
@@ -108,10 +105,6 @@ MIN_SPEED = 30 * 1024
 
 # 替换清单文件名：safe_extract() 写 -> check() 读 -> 读后立即删
 REPLACE_MANIFEST = '_replace_manifest.txt'
-# 已标记 *.old 的文件清单：clean_dir() 写 -> 下次启动 cleanup_stale_old_files() 读并删。
-# 内容为磁盘上的完整名称（含 .old 后缀）。用于【精确清理】：
-# 只删除本清单列出的 *.old，绝不碰用户自己放在程序目录的 .old 文件。
-MARKED_MANIFEST = '_marked_manifest.txt'
 # 被占用文件的临时后缀（“标记”阶段统一改名为此后缀，“清理”阶段据此识别删除）
 OLD_SUFFIX = '.old'
 # 延时替换报告文件名
@@ -151,19 +144,58 @@ REPLACE_ROLLBACK_FLAG = '_replace_rollback.flag'
 # 跨阶段状态文件契约（谁写、谁读、谁删、何时删）—— 集中记录，避免散落各处漏删
 # ---------------------------------------------------------------------------
 #   _replace_manifest.txt   写：safe_extract() | 读：check()            | 删：check() 读后立即删
-#   _marked_manifest.txt    写：clean_dir()    | 读：cleanup_stale_old_*  | 删：cleanup 用后即删
 #   _replace_rollback.flag  写：兜底批处理      | 读：仅人工排查          | 删：下次启动 cleanup_stale_replace_files()
 #   _replace_report.txt     写：兜底批处理      | 读：仅人工排查          | 删：不删（保留证据）
 #   _staging/               写：safe_extract() | 读：replace_staged()    | 删：成功/回滚/兜底/下次启动 cleanup
+#   注：*.old 由 cleanup_stale_old_files() 按后缀扫描清理，不依赖任何状态文件。
 #   以上任一文件"漏删"都可能让下次启动误判流程状态，因此全部集中在
 #   cleanup_stale_replace_files() 与 rollback() 两处收口。
 
-# 回滚清空阶段的【额外】保留项（KEEP_ITEMS 之外）。
-# 备份目录本身、日志、更新包与替换报告都要留下：备份用于手动还原，其余用于排查。
-ROLLBACK_KEEP = {
-    BACKUP_DIR_NAME, 'helper.log', 'app.log', 'app.zip',
-    REPLACE_REPORT, REPLACE_BATCH_LOG, REPLACE_ROLLBACK_FLAG,
-}
+# ---------------------------------------------------------------------------
+# 保留白名单 —— 所有"改名 / 删除 / 覆盖"操作的【唯一来源】
+# ---------------------------------------------------------------------------
+# 条目支持两种形态，两者互不干扰：
+#   · 不含路径分隔符（如 'data'、'app.log'）：匹配顶层同名项，以及它下面的全部内容；
+#   · 含路径分隔符（如 'data/notes.txt'）：只匹配该路径自身及其子树。
+# 需要保护新东西时【只改这里】。历史教训：保留判断曾分散在 clean_dir / rollback /
+# 兜底批处理 / 替换规则四处，导致同一个文件在不同路径下保留语义不一致。
+# 注意 helper.exe 不在此列 —— 它需要在运行中被改名成 *.old 以腾出文件名
+# （Windows 允许重命名运行中的可执行文件，镜像仍由已映射的句柄持有）。
+KEEP_ITEMS = (
+    'data',               # 用户数据目录（名单索引与正文）
+    'app.log',            # 主程序日志
+    'app.log.1',          # 主程序轮转日志（app.py 超过 1MB 时生成）
+    'helper.log',         # 更新器日志
+    REPLACE_BATCH_LOG,    # 兜底批处理日志
+    REPLACE_REPORT,       # 兜底替换报告（诊断证据）
+    BACKUP_DIR_NAME,      # 备份目录（回滚依据；流程在合适时机自行删除）
+    ZIP_ASSET_NAME,       # 当前更新包（解压前必须保留）
+)
+
+# 预计算的顶层名字集合：整项操作（改名/删除/覆盖）只能"整体保留或整体处理"，
+# 因此这里取每个条目的顶层段 —— 某条目位于某个顶层项之下时，该顶层项整体保留。
+KEEP_TOP_NAMES = frozenset(
+    e.replace('\\', '/').strip('/').split('/', 1)[0].lower() for e in KEEP_ITEMS)
+
+
+def is_keep_top(name):
+    """BASE_DIR 下的直接子项是否属于保留白名单（用于整项改名/删除/覆盖）。"""
+    return name.lower() in KEEP_TOP_NAMES
+
+
+def is_keep_rel(rel_path):
+    """相对路径是否属于保留白名单（用于更新包内容的精细分类）。"""
+    norm = rel_path.replace('\\', '/').strip('/').lower()
+    top = norm.split('/', 1)[0]
+    for entry in KEEP_ITEMS:
+        e = entry.replace('\\', '/').strip('/').lower()
+        if '/' in e:
+            if norm == e or norm.startswith(e + '/'):
+                return True
+        elif top == e:
+            return True
+    return False
+
 
 # 替换规则：按顺序匹配，第一条命中的规则决定该文件的处理方式
 #   pattern : 正则表达式（匹配相对路径，大小写不敏感）
@@ -181,12 +213,8 @@ REPLACE_RULES = [
     # 动态库：最容易被进程锁定，替换失败会重试并交兜底批处理
     {'pattern': r'\.(dll|pyd|so|dylib)$', 'mode': 'replace',
      'desc': '动态库，易被占用'},
-    # 用户数据：绝不覆盖
-    {'pattern': r'^data([\\/].*)?$', 'mode': 'skip',
-     'desc': '用户数据目录，保留'},
-    # 日志与备份：不处理
-    {'pattern': r'^(helper\.log|app\.log|_backup([\\/].*)?)$', 'mode': 'skip',
-     'desc': '日志/备份，保留'},
+    # 注：保留白名单（data / 日志 / 备份 / 更新包 等）不在这里判断 ——
+    #     统一由 classify_files() 查 KEEP_ITEMS，避免出现第二份白名单。
     # 临时文件：清理掉（match_replace_rule 用 re.search，无需 .* 前缀）
     {'pattern': r'.*\.(tmp|temp|bak|old)$', 'mode': 'delete',
      'desc': '临时文件，删除'},
@@ -349,32 +377,23 @@ def cleanup_stale_old_files():
     为什么不在退出后的批处理里删：批处理只能固定等待若干秒，而进程退出
     时机不可控，helper.exe.old / VCRUNTIME140*.dll.old 常因仍被占用而失败。
 
-    清理范围【只限 MARKED_MANIFEST 记录的条目】（由 clean_dir 写入）：
-    用户自己放在程序目录里的 .old 文件因此不会被误删；若清单不存在
-    （本次没更新过，或回滚已把 .old 清空），本函数不做任何删除。
+    清理范围：BASE_DIR 顶层的全部 *.old。程序目录内除 KEEP_ITEMS（data 与日志）
+    之外的内容都视为包内容物、由本程序独占，因此顶层 *.old 只可能由 clean_dir()
+    产生 —— 这也是不引入"已标记清单"状态文件的原因：少一个文件就少一个失败点。
+    代价是用户若自行在程序目录放置 *.old 文件，会被一并清理。
 
     时机：必须在获取单实例 Mutex 之后调用 —— 此时无其他 helper 实例。
-    _backup 目录内的 *.old 是回滚依据，绝不触碰。
+    _backup 目录内的 *.old 是回滚依据，绝不触碰（只扫顶层、不递归）。
     """
-    manifest_path = os.path.join(BASE_DIR, MARKED_MANIFEST)
-    if not os.path.exists(manifest_path):
-        log('无待清理清单，跳过 .old 清理', level='DEBUG')
-        return
     try:
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            names = [line.strip() for line in f if line.strip()]
+        names = os.listdir(BASE_DIR)
     except OSError as e:
-        log(f'读取待清理清单失败：{e}，跳过 .old 清理', level='WARN')
+        log(f'扫描程序目录失败，跳过 .old 清理：{e}', level='WARN')
         return
-
-    remaining = []
     for name in names:
-        # 双保险：只处理带 .old 后缀的顶层项
         if not name.endswith(OLD_SUFFIX):
             continue
         path = os.path.join(BASE_DIR, name)
-        if not os.path.exists(path):
-            continue
         try:
             if os.path.isdir(path) and not os.path.islink(path):
                 shutil.rmtree(path)
@@ -382,20 +401,7 @@ def cleanup_stale_old_files():
                 os.remove(path)
             log(f'已清理残留：{name}', level='WARN')
         except OSError as e:
-            remaining.append(name)
             log(f'清理残留 {name} 失败（下次再试）：{e}', level='WARN')
-
-    # 全部成功才删除清单；仍有残留则回写剩余项，下次启动继续尝试
-    try:
-        if remaining:
-            with open(manifest_path, 'w', encoding='utf-8') as f:
-                for name in remaining:
-                    f.write(f'{name}\n')
-        else:
-            os.remove(manifest_path)
-            log(f'已删除待清理清单：{manifest_path}', level='DEBUG')
-    except OSError as e:
-        log(f'更新待清理清单失败：{e}', level='WARN')
 
 
 # ---------------------------------------------------------------------------
@@ -422,10 +428,16 @@ def match_replace_rule(rel_path):
 def classify_files(rel_paths):
     """把文件列表按规则分类。
 
+    先查保留白名单 KEEP_ITEMS（与 clean_dir / rollback 同源），命中即 skip；
+    其余才交给 REPLACE_RULES。这样"某个文件要不要保留"全局只有一处定义。
+
     返回 (to_replace, to_skip, to_delete)，均为 [(相对路径, 规则说明)] 列表。
     """
     to_replace, to_skip, to_delete = [], [], []
     for rel in rel_paths:
+        if is_keep_rel(rel):
+            to_skip.append((rel, '保留白名单'))
+            continue
         rule = match_replace_rule(rel)
         mode = rule.get('mode', 'replace')
         item = (rel, rule.get('desc', ''))
@@ -1007,10 +1019,11 @@ def backup_current(backup_root, exclude=None):
     return skipped
 
 
-def clean_dir(keep=None):
+def clean_dir():
     """【标记】阶段：把 BASE_DIR 下待替换/待清理的项统一改名为 *.old，不直接删除。
 
-    keep: 额外保留的文件/目录名集合（如正在使用的更新包 app.zip）。
+    保留判断统一走 KEEP_ITEMS（见「保留白名单」一节）—— 不再接受调用方传入额外
+    保留集合：保留项只能有一份定义，否则又会退化成"同一文件在不同路径下语义不一致"。
 
     "标记-清理"两阶段设计：
       - 标记（本函数）：只改名加 .old 后缀，绝不删除。被占用（WinError 5/32/33）
@@ -1018,26 +1031,23 @@ def clean_dir(keep=None):
         新文件可直接落位（Windows 允许重命名运行中的可执行文件/动态库）。
       - 清理：推迟到【下次启动 helper】由 cleanup_stale_old_files() 执行 ——
         那时旧进程早已退出、文件不再被占用，删除必然成功。
-        本函数把已标记项写入 MARKED_MANIFEST，清理阶段只删清单内的条目，
-        不会误删用户自己放在程序目录里的 .old 文件。
+        清理按 OLD_SUFFIX 直接扫描顶层，不依赖任何状态文件：程序目录内除
+        KEEP_ITEMS 白名单外均视为包内容物，故顶层 *.old 必为本程序所产生。
 
     返回 (marked, kept)：
       marked - 已改名标记为 .old 的项列表
       kept   - 本次保留的项列表
     """
-    keep = keep or set()
     marked = []
     kept = []
     failed = []
     for item in os.listdir(BASE_DIR):
-        if item.lower() in KEEP_ITEMS:      # 大小写不敏感匹配（data）
-            kept.append(item)
-            continue
-        if item in (BACKUP_DIR_NAME, 'helper.log') or item in keep:
+        if is_keep_top(item):
             kept.append(item)
             continue
         if item.endswith(OLD_SUFFIX):
-            # 已有 .old 残留（上次清理失败的），不重复标记，留给批处理清理
+            # 已有 .old 残留（上次清理失败的），不重复标记，
+            # 留给下次启动的 cleanup_stale_old_files() 清理
             kept.append(item)
             continue
         path = os.path.join(BASE_DIR, item)
@@ -1060,19 +1070,6 @@ def clean_dir(keep=None):
         f'标记失败 {len(failed)} 项')
     if kept:
         log(f'  保留：{kept}', level='DEBUG')
-
-    # 记录本次标记的项（磁盘上的 *.old 名称），供下次启动【精确清理】。
-    # 必须写改名后的全名：清理端按 ".old" 后缀过滤，写原名会被整体跳过。
-    try:
-        with open(os.path.join(BASE_DIR, MARKED_MANIFEST), 'w',
-                  encoding='utf-8') as f:
-            for name in marked:
-                f.write(f'{name}{OLD_SUFFIX}\n')
-        log(f'已记录待清理清单：{MARKED_MANIFEST}（{len(marked)} 项）',
-            level='DEBUG')
-    except OSError as e:
-        log(f'写入待清理清单失败：{e}（这些 .old 将由下次标记时顺带删除）',
-            level='WARN')
 
     return marked, kept
 
@@ -1173,11 +1170,10 @@ def rollback(backup_path):
         return
 
     # 1. 清空（尽力而为）
-    # 保留项 = KEEP_ITEMS（用户数据 data）∪ ROLLBACK_KEEP（备份/日志/更新包/报告）。
-    # 用显式白名单而不是"只保护 data"，让"删什么、留什么"一目了然。
+    # 保留项统一来自 KEEP_ITEMS（见「保留白名单」一节），不再有第二份名单。
     cleared = 0
     for item in os.listdir(BASE_DIR):
-        if item.lower() in KEEP_ITEMS or item in ROLLBACK_KEEP:
+        if is_keep_top(item):
             log(f'  跳过保留项：{item}', level='DEBUG')
             continue
         path = os.path.join(BASE_DIR, item)
@@ -1204,6 +1200,11 @@ def rollback(backup_path):
     restored = 0
     failed = []
     for item in os.listdir(backup_path):
+        if is_keep_top(item):
+            # 保留项在清空段就没被删除，而白名单语义是"不覆盖"：用备份里的
+            # 旧副本回写会覆盖当前内容（尤其会抹掉本次失败过程刚写入的日志）。
+            log(f'  跳过保留项（不覆盖）：{item}', level='DEBUG')
+            continue
         src = os.path.join(backup_path, item)
         dst = os.path.join(BASE_DIR, item)
         try:
@@ -1254,12 +1255,11 @@ def apply_update(zip_path):
         shutil.rmtree(backup_root, ignore_errors=True)
         return False, '备份失败'
 
-    # 2. 标记（除 KEEP_ITEMS 外全部改名为 *.old，不直接删除；
-    #    必须保留更新包本身，否则第 3 步无包可解）
+    # 2. 标记（白名单之外全部改名为 *.old，不直接删除；
+    #    更新包本身已在 KEEP_ITEMS 中，故第 3 步仍有包可解）
     t = _t.time()
-    zip_name = os.path.basename(zip_path)
     try:
-        marked, kept = clean_dir(keep={zip_name})
+        marked, kept = clean_dir()
         log(f'[2/3] 标记完成，耗时 {_t.time() - t:.2f}s，'
             f'{len(marked)} 项待批处理清理')
     except Exception as e:
@@ -1493,6 +1493,14 @@ def _gen_replace_batch(items, delete_backup, backup_root, launch_main=False):
         L.append('')
 
     # ---- 失败判定与回滚 ----
+    # 回滚清空段的保留判断与 KEEP_ITEMS 同源：把白名单条目的顶层名字逐个转成
+    # cmd 的 `if /i not "%%~nxX"=="name"` 守卫，避免批处理再维护第二份白名单。
+    keep_guard_dir = ''.join(
+        f'if /i not "%%~nxD"=="{_bat_escape(n)}" '
+        for n in sorted(KEEP_TOP_NAMES))
+    keep_guard_file = ''.join(
+        f'if /i not "%%~nxF"=="{_bat_escape(n)}" '
+        for n in sorted(KEEP_TOP_NAMES))
     # 只要有任一文件替换失败，就从 _backup 全量回滚到更新前状态
     L += [
         ':: ---------- 失败判定与回滚 ----------',
@@ -1505,18 +1513,15 @@ def _gen_replace_batch(items, delete_backup, backup_root, launch_main=False):
         f'  goto :no_rollback',
         ')',
         '',
-        # 1. 清空当前目录（保留 _backup、data、helper.log、回滚标记）
-        #    data 是用户名单数据目录，必须与 KEEP_ITEMS 语义一致地保护：
-        #    若备份阶段 data 被占用跳过，清空后 xcopy 无法还原 -> 用户数据永久丢失。
+        # 1. 清空当前目录（白名单来自 KEEP_ITEMS，与 clean_dir / rollback 同源）
+        #    data 是用户名单数据目录，必须与白名单一致地保护：若备份阶段 data 被
+        #    占用跳过，清空后 xcopy 无法还原 -> 用户数据永久丢失。
         f'echo [%date% %time%] 回滚步骤 1/2：清空当前文件 >> "%LOG%"',
         f'for /d %%D in ("%BASE%\\*") do (',
-        f'  if /i not "%%~nxD"=="{BACKUP_DIR_NAME}" '
-        f'if /i not "%%~nxD"=="data" rmdir /s /q "%%D" >nul 2>&1',
+        f'  {keep_guard_dir}rmdir /s /q "%%D" >nul 2>&1',
         ')',
         f'for %%F in ("%BASE%\\*") do (',
-        f'  if /i not "%%~nxF"=="helper.log" '
-        f'if /i not "%%~nxF"=="{REPLACE_REPORT}" '
-        f'if /i not "%%~nxF"=="app.zip" del /f /q "%%F" >nul 2>&1',
+        f'  {keep_guard_file}del /f /q "%%F" >nul 2>&1',
         ')',
         '',
         # 2. 从备份还原
@@ -1531,7 +1536,7 @@ def _gen_replace_batch(items, delete_backup, backup_root, launch_main=False):
         f'  echo [%date% %time%] 回滚还原完成 >> "%LOG%"',
         ')',
         '',
-        # 写入回滚标记（进度窗口据此识别）
+        # 写入回滚标记（供人工排查；下次启动由 cleanup_stale_replace_files 清理）
         f'echo rollback > "%BASE%\\{REPLACE_ROLLBACK_FLAG}"',
         f'echo [%date% %time%] 回滚完成 >> "%LOG%"',
         '',
@@ -1552,10 +1557,10 @@ def _gen_replace_batch(items, delete_backup, backup_root, launch_main=False):
     ]
 
     # ---- 清理 .old 残留：不在此处做 ----
-    # 原设计由本段扫删 *.old，但实测进度窗口（第二个 helper.exe 实例）
-    # 退出时机不可控，helper.exe.old / VCRUNTIME140*.dll.old 常因仍被占用
-    # 而删除失败；残留的 helper.exe.old 会让下次更新的标记逻辑"放弃标记"，
-    # 导致新 helper.exe 无法就位、更新静默失败。
+    # 原设计由本段扫删 *.old，但批处理只能固定等待若干秒，而进程退出时机
+    # 不可控（系统可能仍持有映像句柄），helper.exe.old / VCRUNTIME140*.dll.old
+    # 常因仍被占用而删除失败；残留的 helper.exe.old 会让下次更新的标记逻辑
+    # "放弃标记"，导致新 helper.exe 无法就位、更新静默失败。
     # 现改为：由下次启动 helper 时（cleanup_stale_old_files）删除 ——
     # 那时旧进程早已退出，文件不再被占用，删除必然成功。
 
@@ -1925,7 +1930,9 @@ class HelperApp:
             log('主程序未运行，直接更新')
 
         self._ui(self.set_status, f'发现新版本 {remote_tag}，下载中...')
-        zip_path = os.path.join(BASE_DIR, 'app.zip')
+        # 更新包文件名统一取 ZIP_ASSET_NAME：它同时是下载名与 KEEP_ITEMS 里的
+        # 保留项（标记阶段不能把更新包自己改名，否则解压时无包可用）。
+        zip_path = os.path.join(BASE_DIR, ZIP_ASSET_NAME)
         t = _t.time()
         # 进度回调收到的是"已下载字节数"，这里换算成比例。
         # 分母由 size_cb 在探测到总大小时回填（atom 渠道拿不到文件大小）
