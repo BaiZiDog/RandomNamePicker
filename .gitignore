@@ -32,6 +32,11 @@ MANIFEST
 *.manifest
 *.spec
 
+# 发版资产留档（Inno 安装器 NamePicker.exe / 更新包 app.zip 等大文件，不进仓库）
+# 注意：该目录下的 1.iss（打包脚本）也会随之不被跟踪 ——
+# 若希望版本化打包脚本，见 .trae/documents/release-process.md 的说明。
+/release/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
