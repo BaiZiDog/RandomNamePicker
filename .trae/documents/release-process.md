@@ -198,16 +198,19 @@ Source: "D:\PythonProject\RandomNamePicker\dist\RandomNamePicker\helper.exe"; De
 Source: "D:\PythonProject\RandomNamePicker\dist\RandomNamePicker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ```
 
-**另外两个待修正项（强烈建议尽早处理）**：
+**已在 `release/v2.0/1.iss`（= 后续版本的模板）中修正**：
 
-1. **`AppId` 三个版本各不相同** → Inno 视为三个不同程序，安装新版**不会覆盖旧版**，
-   会并存多份安装（且卸载/升级路径混乱）：
-   - v1.5 `{9A25ACD3-B42A-4020-9A19-5D9027381AC3}`
-   - v1.5-fix `{8679EAB0-EF54-4112-B0EC-9F0176E1E718}`
-   - v2.0 `{5544B66A-CA07-4C55-9406-40B217CCA383}`
-   　→ 应固定为同一个 `AppId`（首次正式发布时生成的那个），此后各版沿用。
-2. **`DefaultDirName` 被写死盘符**：v1.5-fix 与 v2.0 为 `D:\Program Files\{#MyAppName}`，
-   无 D 盘的机器会失败；应改用 `{autopf}\{#MyAppName}`（v1.5 已是这种写法）。
+| 项 | 原状 | 现状 |
+|---|---|---|
+| `[Files] Source` | 指向已不存在的 `dist\RandomNamePicker-202709282155\*` | `dist\RandomNamePicker\*`（与 `build.py` 输出一致） |
+| `DefaultDirName` | `D:\Program Files\{…}`（写死盘符） | `{autopf}\{#MyAppName}` |
+| `AppId` | 与 v1.5 / v1.5-fix 各不相同 | **统一采用 v2.0 的 `{5544B66A-…}` 作为全仓库唯一值**，后续版本一律沿用（文件内已加注释） |
+
+> **AppId 约定**：它是 Inno 判断"是不是同一个程序"的唯一依据，各版必须完全一致；
+> 换 GUID 会导致新版与旧版**并存安装**而不会覆盖升级。
+> 历史版本 v1.5（`{9A25ACD3-…}`）、v1.5-fix（`{8679EAB0-…}`）的 `1.iss` 保持原样作为
+> 发布记录，**不要拿它们当模板**。
+> 已经用旧 AppId 装过的用户，新版仍会与其并存 —— 需手动卸载旧版后重装。
 
 > `MyAppExeName` 三版均为 `helper.exe` ✅ —— 必须保持：安装器的启动项要是更新器，
 > 否则用户绕过更新链路直接进主程序。
@@ -245,11 +248,9 @@ print('是否疑似有包装目录:', all(x.startswith(n[0].split('/')[0] + '/')
 
 ## 8. 其他注意事项
 
-- `release/` 已加入 `.gitignore`，其中的安装器与 `app.zip`（几十 MB）不会被提交。
-  **副作用**：`1.iss` 也一并变成不被跟踪 —— 打包脚本是发版配方，丢了就得重写。
-  若要版本化，建议二选一：
-  ① 把忽略规则收窄为只忽略大文件（`/release/**/*.exe`、`/release/**/*.zip`），
-  ② 或在仓库内另存一份 `1.iss` 模板（例如 `.trae/documents/` 下）。
+- `.gitignore` 只忽略 `release/` 下的大体积二进制（`/release/**/*.exe`、`/release/**/*.zip`）；
+  **`1.iss` 与 Release 元数据 JSON 纳入版本管理**，发版配方不会丢。
+  其中的 `*-release.json`（资产元数据备份）体积很小，可按需一并提交。
 - `dist/`、`build/` 已被 `.gitignore` 忽略，构建产物不会误入仓库。
 - 每次发版必须同步推进 `helper.py` 的 `LOCAL_VERSION`，否则用户端检测不到新版本。
 - 只更新 `app.zip` 而忘记重新编译安装器 → 新装用户拿到旧代码（两者必须同源同版）。
