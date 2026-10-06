@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "NamePicker"
-#define MyAppVersion "v2.0"
+#define MyAppVersion "v1.5.a"
 #define MyAppPublisher "github@BaiZiDog"
 #define MyAppURL "https://github.com/BaiZiDog/RandomNamePicker/"
 #define MyAppExeName "helper.exe"
@@ -38,7 +38,7 @@ LicenseFile=D:\PythonProject\RandomNamePicker\LICENSE
 ; Uncomment the following line to run in non administrative install mode (install for current user only).
 ;PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-OutputDir=D:\PythonProject\RandomNamePicker\release\v2.0
+OutputDir=D:\PythonProject\RandomNamePicker\release\1.5.a
 OutputBaseFilename=NamePicker
 SolidCompression=yes
 WizardStyle=modern windows11
@@ -51,10 +51,10 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 取自本版暂存载荷 build\release-payload\v2.0（内容同 dist 产物，但 data\ 只含示例名单：
+; 取自本版暂存载荷 build\release-payload\v1.5.a（内容同 dist 产物，但 data\ 只含示例名单：
 ; 已排除真实名册 九班名册.txt，file.txt 指向 example.txt）。
-Source: "D:\PythonProject\RandomNamePicker\build\release-payload\v2.0\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "D:\PythonProject\RandomNamePicker\build\release-payload\v2.0\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "D:\PythonProject\RandomNamePicker\build\release-payload\v1.5.a\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "D:\PythonProject\RandomNamePicker\build\release-payload\v1.5.a\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [UninstallDelete]
