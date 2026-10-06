@@ -37,6 +37,12 @@ MANIFEST
 /release/**/*.exe
 /release/**/*.zip
 
+# 只在本机保留的文档：仓库仅保留 README.md
+# （流程文档保留在仓库根目录，便于与 app.py/helper.py 一起查看，但不纳入版本管理）
+/RELEASE.md
+/debug-*.md
+/.trae/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
